@@ -108,21 +108,37 @@ def get_dataset_images(config, tasks=["train","val"]):
     return datasets
 
 def on_predict_start(predictor: object, persist: bool = False) -> None:
+    # Expanded feature extraction relies on kept-anchor indices from NMS; this is
+    # unavailable/incompatible in end-to-end decode paths.
+    is_end2end = bool(getattr(getattr(predictor, "model", None), "end2end", False))
+    if is_end2end:
+        predictor.save_feats = False
+        predictor.expanded_feats = False
+        predictor._feats = None
+        return
+
     predictor.save_feats = True
     predictor.expanded_feats = True
     predictor._feats = None
+
+    # Install hooks only once per predictor instance.
+    if getattr(predictor, "_feat_hooks_installed", False):
+        return
+
     # Register hooks to extract input and output of Detect layer
     def pre_hook(module, input):
         # Keep detached references; cloning these large feature maps is expensive.
         predictor._feats = [t.detach() for t in input[0]]
 
     predictor.model.model.model[-1].register_forward_pre_hook(pre_hook)
+    predictor._feat_hooks_installed = True
 
 def get_feat_process_batch(batch, model, img_size, person_class_index=0):
     images=[b["img"] for b in batch]
     results=model.predict(images, verbose=False, half=True,
                           conf=0.1, classes=[person_class_index],
-                          imgsz=[img_size,img_size], rect=True)
+                          imgsz=[img_size,img_size], rect=True,
+                          end2end=False)
     ret_feats=[]
     ret_ids=[]
     ret_idx=[]

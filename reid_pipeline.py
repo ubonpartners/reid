@@ -413,6 +413,12 @@ def main():
     parser.add_argument("--test", action="store_true", help="Run fast smoke mode (small dataset, short training)")
     parser.add_argument("--project", type=str, default=None, help="Override output project directory")
     parser.add_argument("--name", type=str, default=None, help="Override run name")
+    parser.add_argument(
+        "--max-processes",
+        type=int,
+        default=None,
+        help="Optional cap for dataset-generation worker processes (applies to config num_workers).",
+    )
     parser.add_argument("--force", action="store_true", help="Force rerun stages even if artifacts exist")
     opt = parser.parse_args()
     stuff.configure_root_logger(opt.logging)
@@ -422,6 +428,10 @@ def main():
         cfg["project"] = opt.project
     if opt.test:
         cfg = apply_test_mode(cfg)
+    if opt.max_processes is not None:
+        if opt.max_processes < 1:
+            raise ValueError("--max-processes must be >= 1")
+        cfg["num_workers"] = min(int(cfg.get("num_workers", 1)), int(opt.max_processes))
 
     base_model = opt.base_model
     if not os.path.exists(base_model):
@@ -440,6 +450,7 @@ def main():
     manifest["mode"] = {
         "run": opt.run,
         "test": bool(opt.test),
+        "max_processes": opt.max_processes,
         "force": bool(opt.force),
     }
     write_manifest(paths["manifest"], manifest)
