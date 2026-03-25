@@ -1,0 +1,40 @@
+# Pip-friendly requirements for the REID adapter tooling.
+#
+# Notes:
+# - For best performance (GPU FAISS + matching CUDA build of PyTorch), prefer `environment.yml`.
+# - If you want GPU FAISS via conda, install `faiss-gpu` separately and omit `faiss-cpu` below.
+# - Installing CUDA-enabled PyTorch via pip typically requires selecting the correct wheel/index URL
+#   for your platform. See PyTorch install instructions for your CUDA version.
+
+numpy==1.26.4
+tqdm
+pandas
+matplotlib
+scikit-learn
+albumentations
+
+opencv-python
+scipy
+requests
+lap
+psutil
+cython_bbox
+piexif
+xlsxwriter
+xmltodict
+pyyaml
+pillow
+scikit-image
+pycairo
+
+# FAISS (pip default). Replace with conda `faiss-gpu` if desired.
+faiss-cpu
+
+# PyTorch (version left flexible; pin if you need exact reproducibility)
+torch>=2.4.0
+torchvision
+torchaudio
+
+# Project dependencies (custom forks)
+git+https://github.com/ubonpartners/stuff.git
+git+https://github.com/ubonpartners/ultralytics.git@multilabel

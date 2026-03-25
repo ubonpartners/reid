@@ -1,0 +1,25 @@
+{
+  "status": "ok",
+  "image": "/mldata/image/arrest2.jpg",
+  "device": "cuda:0",
+  "base_model": "/mldata/models/v10/pt/yolo26s-v10-210226.pt",
+  "fused_model": "/home/mark/stuff/ubonpartners/reid/runs/yolo26s-v10-210226-smoke/yolo26s-v10-210226-posereid.pt",
+  "detections": {
+    "base_count": 24,
+    "fused_count": 24,
+    "count_equal": true,
+    "matched_all": true,
+    "min_iou": 0.9999999959088166,
+    "max_conf_diff": 0.0,
+    "mean_conf_diff": 0.0
+  },
+  "reid": {
+    "present": true,
+    "rows": 24,
+    "dim": 80,
+    "expected_dim": 80,
+    "person_class_idx": 0,
+    "person_detections": 15,
+    "person_vectors_ok": true
+  }
+}

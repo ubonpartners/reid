@@ -1,0 +1,36 @@
+name: reid
+channels:
+  - pytorch
+  - defaults
+  - conda-forge
+  - nvidia
+dependencies:
+  - python>=3.10
+  - pytorch>=2.4.0
+  - pytorch-cuda>=12.4
+  - torchvision>=0.8
+  - torchaudio
+  - tqdm
+  - numpy==1.26.4
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - albumentations
+  - faiss-gpu
+  - pip
+  - pip:
+    - opencv-python
+    - scipy
+    - requests
+    - lap
+    - psutil
+    - cython_bbox
+    - piexif
+    - xlsxwriter
+    - xmltodict
+    - pyyaml
+    - pillow
+    - scikit-image
+    - pycairo
+    - git+https://github.com/ubonpartners/stuff.git
+    - git+https://github.com/ubonpartners/ultralytics.git@multilabel
