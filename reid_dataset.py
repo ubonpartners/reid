@@ -13,6 +13,101 @@ import json
 import random
 import cv2
 import os
+from pathlib import Path
+
+try:
+    import albumentations as A
+except Exception:
+    A = None
+
+
+_AUG_TRANSFORM_CACHE = {}
+
+
+def _build_albumentations_transform(set_name):
+    key = (set_name or "none").strip().lower()
+    if key in _AUG_TRANSFORM_CACHE:
+        return _AUG_TRANSFORM_CACHE[key]
+    if A is None:
+        _AUG_TRANSFORM_CACHE[key] = None
+        return None
+
+    if key in ("none", "off", "disabled"):
+        transforms = []
+    elif key == "aggressive_motion":
+        transforms = [
+        A.OneOf([
+            A.MotionBlur(blur_limit=3),
+            A.GaussianBlur(blur_limit=3),
+            A.MedianBlur(blur_limit=3),
+        ], p=0.25),
+
+        A.RandomBrightnessContrast(
+            brightness_limit=0.12,
+            contrast_limit=0.15,
+            p=0.2
+        ),
+        A.RandomGamma(gamma_limit=(90, 115), p=0.1),
+        A.HueSaturationValue(
+            hue_shift_limit=6,
+            sat_shift_limit=10,
+            val_shift_limit=8,
+            p=0.1
+        ),
+        A.ISONoise(
+            color_shift=(0.01, 0.02),
+            intensity=(0.03, 0.08),
+            p=0.05
+        ),
+        A.ImageCompression(quality_range=(50, 95), p=0.15),
+        A.RandomRain(p=0.02),
+        A.ToGray(p=0.02),
+    ]
+    else:
+        transforms = [
+            A.Blur(p=0.05),
+            A.MedianBlur(p=0.05),
+            A.MotionBlur(p=0.08),
+            A.ToGray(p=0.02),
+            A.CLAHE(p=0.03),
+            A.RandomBrightnessContrast(p=0.08),
+            A.RandomGamma(p=0.05),
+            A.ISONoise(p=0.1),
+            A.ChromaticAberration(p=0.02),
+            A.ImageCompression(quality_range=(30, 100), p=0.1),
+        ]
+    _AUG_TRANSFORM_CACHE[key] = A.Compose(transforms) if transforms else None
+    return _AUG_TRANSFORM_CACHE[key]
+
+
+def _apply_post_aug_image(img, effect_prob, albumentations_set):
+    if effect_prob <= 0 or random.random() >= effect_prob:
+        return img
+    transform = _build_albumentations_transform(albumentations_set)
+    if transform is None:
+        return img
+    img_np = np.asarray(img)
+    return transform(image=img_np)["image"]
+
+
+def _normalize_aug_policy(policy):
+    if not isinstance(policy, dict):
+        return {}
+    out = dict(policy)
+    if "augmentations" in out and "num_aug" not in out:
+        out["num_aug"] = out["augmentations"]
+    if "aug_rotate" in out and "rotate_prob" not in out:
+        out["rotate_prob"] = out["aug_rotate"]
+    if "aug_effects" in out and "effect_prob" not in out:
+        out["effect_prob"] = out["aug_effects"]
+    return out
+
+
+def _canonical_loader_token(name):
+    s = "".join(ch for ch in str(name).lower() if ch.isalnum())
+    if s.endswith("loader"):
+        s = s[:-len("loader")]
+    return s
 
 def _ioma_score_matrix(grid_boxes, det_boxes, det_conf):
     """
@@ -82,11 +177,12 @@ def get_dataset_images(config, tasks=["train","val"]):
         loader_class=ru.get_dataset_loader(d)
 
         if "train" in tasks:
-            this_train, _, this_train_num=loader_get_images(
+            this_train, train_name, this_train_num=loader_get_images(
                 loader_class, "train", max_ids_per_image, max_ids_per_loader=max_ids_per_loader
             )
             train+=this_train
             total_train_images+=this_train_num
+            datasets["train_"+train_name]=this_train
 
         if "val" in tasks:
             valset, name, _=loader_get_images(
@@ -182,7 +278,12 @@ def make_feat_process_batch_work(model, batch_work):
                                              w["img_size"], w["img_size"],
                                              max_random_shrink=0.5,
                                              aug_rotate=w["aug_rotate"],
-                                             aug_effects=w["aug_effects"])
+                                             aug_effects=0)
+        img = _apply_post_aug_image(
+            img,
+            effect_prob=float(w.get("aug_effect_prob", 0)),
+            albumentations_set=w.get("albumentations_set", "standard"),
+        )
         image_batch.append({"img":img,
                             "grid_boxes":grid_boxes,
                             "id_list":w["ids"],
@@ -204,7 +305,7 @@ def make_model(args):
 
 def get_feats(img_list, id_list_in, index_list_in, model_name,
               name, batch_size=64, num_aug=0,
-              aug_rotate=False, aug_effects=False,
+              aug_rotate=False, aug_effect_prob=0, albumentations_set="standard",
               num_workers=1, num_classes=40,
               debug_feature_stats=False,
               mp_min_work_items=6,
@@ -248,7 +349,8 @@ def get_feats(img_list, id_list_in, index_list_in, model_name,
         batch_work_item={"imgs":imgs, "ids":ids, "idxs": idxs, "N":N, "M":M,
                          "img_size":img_size,
                          "aug_rotate":aug_rotate,
-                         "aug_effects":aug_effects}
+                         "aug_effect_prob":aug_effect_prob,
+                         "albumentations_set":albumentations_set}
         batch_work.append(batch_work_item)
         if len(batch_work)>=batch_size:
             work_items.append(batch_work)
@@ -314,11 +416,152 @@ def get_feats(img_list, id_list_in, index_list_in, model_name,
 
     return feat_list, id_list, idx_list, debug
 
+
+def _resolve_train_loader_policies(config):
+    datasets_cfg = config.get("datasets", {})
+    loader_names = datasets_cfg.get("loaders", [])
+
+    global_defaults = {
+        "num_aug": int(config.get("train_augmentations", 3)),
+        "rotate_prob": float(config.get("train_aug_rotate", 0)),
+        "effect_prob": float(config.get("train_aug_effects", 0)),
+        "albumentations_set": str(config.get("train_albumentations_set", "standard")),
+    }
+
+    policies = {}
+    for loader_name in loader_names:
+        loader_class = ru.get_dataset_loader(loader_name)
+        defaults = dict(global_defaults)
+        if hasattr(loader_class, "get_train_augmentation_defaults"):
+            loader_defaults = loader_class.get_train_augmentation_defaults()
+            if isinstance(loader_defaults, dict):
+                defaults.update(_normalize_aug_policy(loader_defaults))
+        policies[_canonical_loader_token(loader_name)] = defaults
+
+    override_map = config.get("train_loader_augmentations")
+    if not isinstance(override_map, dict):
+        override_map = datasets_cfg.get("loader_augmentations", {})
+    if isinstance(override_map, dict):
+        for name, overrides in override_map.items():
+            if not isinstance(overrides, dict):
+                continue
+            key = _canonical_loader_token(name)
+            if key not in policies:
+                policies[key] = dict(global_defaults)
+            policies[key].update(_normalize_aug_policy(overrides))
+    return policies, global_defaults
+
+
+def _extract_loader_key_from_dataset_name(dataset_name):
+    if dataset_name.startswith("train_"):
+        return _canonical_loader_token(dataset_name[len("train_"):])
+    return None
+
+
+def _generate_aug_preview(datasets, dataset_name, aug_cfg, preview_dir, sample_count=12):
+    if not preview_dir or sample_count <= 0:
+        return
+    if dataset_name not in datasets:
+        return
+    identities = datasets[dataset_name]
+    if len(identities) == 0:
+        return
+
+    os.makedirs(preview_dir, exist_ok=True)
+    items = [(2, 1), (3, 1), (3, 2), (4, 2), (4, 3), (5, 3), (6, 3), (5, 4), (7, 4), (8, 5)]
+    saved = 0
+    attempts = 0
+    max_attempts = max(sample_count * 10, 20)
+    while saved < sample_count and attempts < max_attempts:
+        attempts += 1
+        N, M = random.choice(items)
+        need = N * M
+        selected_ids = random.choices(identities, k=need)
+        imgs = []
+        for identity_imgs in selected_ids:
+            if not identity_imgs:
+                continue
+            imgs.append(random.choice(identity_imgs))
+        if len(imgs) == 0:
+            continue
+        img_size = random.choice([512, 640, 704, 768, 832, 864, 960])
+        canvas, _ = stuff.create_image_grid(
+            imgs,
+            M,
+            N,
+            img_size,
+            img_size,
+            max_random_shrink=0.5,
+            aug_rotate=float(aug_cfg.get("rotate_prob", 0)),
+            aug_effects=0,
+        )
+        canvas = _apply_post_aug_image(
+            canvas,
+            effect_prob=float(aug_cfg.get("effect_prob", 0)),
+            albumentations_set=aug_cfg.get("albumentations_set", "standard"),
+        )
+        out = cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
+        out_name = f"{dataset_name}_{saved:03d}.jpg"
+        cv2.imwrite(str(Path(preview_dir) / out_name), out)
+        saved += 1
+
+
+def _run_dataset_feature_extract(dataset_name, dataset_groups, config, num_classes,
+                                 batch_size, debug_feature_stats, mp_min_work_items,
+                                 force_multiprocess, aug_cfg):
+    id_list = []
+    image_list = []
+    index = 0
+    for identity_imgs in dataset_groups:
+        id_list += [index] * len(identity_imgs)
+        image_list += identity_imgs
+        index += 1
+
+    num_workers = int(config.get("num_workers", 4))
+    num_original_images = len(image_list)
+    img_indices = list(range(len(image_list)))
+    feat_list, id_list, img_indices, dbg = get_feats(
+        image_list,
+        id_list,
+        img_indices,
+        config["yolo_model"],
+        name=dataset_name,
+        batch_size=batch_size,
+        num_aug=int(aug_cfg.get("num_aug", 0)),
+        aug_rotate=float(aug_cfg.get("rotate_prob", 0)),
+        aug_effect_prob=float(aug_cfg.get("effect_prob", 0)),
+        albumentations_set=aug_cfg.get("albumentations_set", "standard"),
+        num_workers=num_workers,
+        num_classes=num_classes,
+        debug_feature_stats=debug_feature_stats,
+        mp_min_work_items=mp_min_work_items,
+        force_multiprocess=force_multiprocess,
+    )
+    assert len(feat_list) == len(id_list)
+    filtered = [(v, id_, idx) for v, id_, idx in zip(feat_list, id_list, img_indices) if v is not None]
+    if len(filtered) == 0:
+        print(f"    Dataset {dataset_name:30s} {0:5d} IDs {0:6d} images (from {num_original_images:6d} input) dbg:{dbg} [EMPTY]")
+        return (
+            np.empty((0, 0), dtype=np.float32),
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.int64),
+        )
+    filtered_vectors, filtered_ids, filtered_indices = zip(*filtered)
+    features_np = torch.stack([v.cpu() for v in filtered_vectors]).numpy().astype(np.float32)
+    labels_np = np.array(filtered_ids, dtype=np.int64)
+    indices_np = np.array(filtered_indices, dtype=np.int64)
+    num_ids = len(np.unique(filtered_ids))
+    print(f"    Dataset {dataset_name:30s} {num_ids:5d} IDs {len(filtered_vectors):6d} images (from {num_original_images:6d} input) dbg:{dbg}")
+    return features_np, labels_np, indices_np
+
 def make_reid_feats(config=None, datasets=None, save=True):
     batch_size=config.get("yolo_batch_size", 64)
     debug_feature_stats = bool(config.get("debug_feature_stats", False))
     mp_min_work_items = int(config.get("mp_min_work_items", 6))
     force_multiprocess = bool(config.get("force_multiprocess", False))
+    train_loader_policies, global_train_aug = _resolve_train_loader_policies(config)
+    preview_dir = config.get("train_aug_preview_dir")
+    preview_per_loader = int(config.get("train_aug_preview_count_per_loader", 12))
 
     model=YOLO(config["yolo_model"],  verbose=False)
     num_classes = len(model.names)
@@ -328,56 +571,87 @@ def make_reid_feats(config=None, datasets=None, save=True):
 
     print("Generated features-")
     output_dict={}
+
+    # Build each training loader separately to allow loader-specific augmentation policy.
+    train_loader_keys = [k for k in datasets.keys() if k.startswith("train_")]
+    if len(train_loader_keys) == 0 and "train" in datasets:
+        train_loader_keys = ["train"]
+
+    train_parts = []
+    label_offset = 0
+    for d in sorted(train_loader_keys):
+        dataset_groups = datasets[d]
+        loader_key = _extract_loader_key_from_dataset_name(d)
+        aug_cfg = dict(global_train_aug)
+        if loader_key is not None:
+            aug_cfg.update(train_loader_policies.get(loader_key, {}))
+        if d == "train":
+            aug_cfg = dict(global_train_aug)
+
+        if preview_dir:
+            _generate_aug_preview(
+                datasets,
+                d,
+                aug_cfg,
+                preview_dir=preview_dir,
+                sample_count=preview_per_loader,
+            )
+
+        features_np, labels_np, indices_np = _run_dataset_feature_extract(
+            dataset_name=d,
+            dataset_groups=dataset_groups,
+            config=config,
+            num_classes=num_classes,
+            batch_size=batch_size,
+            debug_feature_stats=debug_feature_stats,
+            mp_min_work_items=mp_min_work_items,
+            force_multiprocess=force_multiprocess,
+            aug_cfg=aug_cfg,
+        )
+        output_dict[f"{d}_feats"] = features_np
+        output_dict[f"{d}_labels"] = labels_np
+        output_dict[f"{d}_indices"] = indices_np
+
+        if labels_np.size > 0:
+            labels_shifted = labels_np + label_offset
+            train_parts.append((features_np, labels_shifted, indices_np))
+            label_offset += int(labels_np.max()) + 1
+
+    if train_parts:
+        output_dict["train_feats"] = np.concatenate([x[0] for x in train_parts], axis=0)
+        output_dict["train_labels"] = np.concatenate([x[1] for x in train_parts], axis=0)
+        output_dict["train_indices"] = np.concatenate([x[2] for x in train_parts], axis=0)
+    elif "train" in datasets or len(train_loader_keys) > 0:
+        output_dict["train_feats"] = np.empty((0, 0), dtype=np.float32)
+        output_dict["train_labels"] = np.array([], dtype=np.int64)
+        output_dict["train_indices"] = np.array([], dtype=np.int64)
+
+    # Non-train datasets use default (non-augmented) extraction.
     for d in datasets:
-        id_list=[]
-        image_list=[]
-        index=0
-        for i in datasets[d]:
-            id_list+=[index]*len(i)
-            image_list+=i
-            index+=1
-
-        num_aug=0
-        aug_rotate=0
-        aug_effects=0
-        if d=="train":
-            num_aug=config.get("train_augmentations",3)
-            aug_rotate=config.get("train_aug_rotate", 0)
-            aug_effects=config.get("train_aug_effects", 0)
-        num_workers=config.get("num_workers", 4)
-
-        num_original_images=len(image_list)
-        img_indices = list(range(len(image_list)))
-        feat_list, id_list, img_indices, dbg=get_feats(image_list, id_list, img_indices, config["yolo_model"],
-                                                       name=d, batch_size=batch_size, num_aug=num_aug,
-                                                       aug_rotate=aug_rotate, aug_effects=aug_effects,
-                                                       num_workers=num_workers, num_classes=num_classes,
-                                                       debug_feature_stats=debug_feature_stats,
-                                                       mp_min_work_items=mp_min_work_items,
-                                                       force_multiprocess=force_multiprocess)
-        assert len(feat_list)==len(id_list)
-
-        filtered = [(v, id_, idx) for v, id_, idx in zip(feat_list, id_list, img_indices) if v is not None]
-        if len(filtered) == 0:
-            print(f"    Dataset {d:30s} {0:5d} IDs {0:6d} images (from {num_original_images:6d} input) dbg:{dbg} [EMPTY]")
-            output_dict[f"{d}_feats"] = np.empty((0, 0), dtype=np.float32)
-            output_dict[f"{d}_labels"] = np.array([], dtype=np.int64)
-            output_dict[f"{d}_indices"] = np.array([], dtype=np.int64)
+        if d == "train" or d.startswith("train_"):
             continue
-        filtered_vectors, filtered_ids, filtered_indices = zip(*filtered)
-
-        # Step 2: Convert to CPU and then to numpy arrays
-        features_np = torch.stack([v.cpu() for v in filtered_vectors]).numpy().astype(np.float32)
-        labels_np = np.array(filtered_ids)
-        indices_np = np.array(filtered_indices)
-        num_ids=len(np.unique(filtered_ids))
-        print(f"    Dataset {d:30s} {num_ids:5d} IDs {len(filtered_vectors):6d} images (from {num_original_images:6d} input) dbg:{dbg}")
+        features_np, labels_np, indices_np = _run_dataset_feature_extract(
+            dataset_name=d,
+            dataset_groups=datasets[d],
+            config=config,
+            num_classes=num_classes,
+            batch_size=batch_size,
+            debug_feature_stats=debug_feature_stats,
+            mp_min_work_items=mp_min_work_items,
+            force_multiprocess=force_multiprocess,
+            aug_cfg={
+                "num_aug": 0,
+                "rotate_prob": 0.0,
+                "effect_prob": 0.0,
+                "albumentations_set": "none",
+            },
+        )
         output_dict[f"{d}_feats"]=features_np
         output_dict[f"{d}_labels"]=labels_np
         output_dict[f"{d}_indices"]=indices_np
 
     # Step 4: Save to .npy files
-    metadata={"config":config, "raw":raw}
+    metadata={"config":config, "raw":raw, "train_loader_policies": train_loader_policies}
     if save:
         output=config["reid_dataset"]
         np.savez(output, **output_dict, metadata=json.dumps(metadata))

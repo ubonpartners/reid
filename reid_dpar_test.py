@@ -48,10 +48,76 @@ def _to_numpy1d(v):
     return np.asarray(v, dtype=np.float32)
 
 
+def _image_to_bgr(image_or_path):
+    """
+    Accept either an image path or an in-memory numpy image and return BGR uint8.
+    """
+    if isinstance(image_or_path, np.ndarray):
+        img = image_or_path
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        elif img.ndim == 3 and img.shape[2] == 3:
+            pass
+        else:
+            return None
+        if img.dtype != np.uint8:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        return img
+
+    if isinstance(image_or_path, (str, os.PathLike)):
+        return cv2.imread(str(image_or_path))
+    return None
+
+
 def _build_compact_test_label(model_path, reid_model_pt, grid_cols, grid_rows):
     model_label = os.path.basename(model_path)
-    adapter_label = os.path.basename(reid_model_pt) if reid_model_pt else "none"
-    return f"{model_label} | reid:{adapter_label} | g:{grid_cols}x{grid_rows}"
+    parts = [model_label]
+    if reid_model_pt:
+        parts.append(f"reid:{os.path.basename(reid_model_pt)}")
+    return " | ".join(parts)
+
+
+def _parse_regenerate_datasets(config_value, available_datasets):
+    """
+    Parse config value for dataset cache invalidation.
+    Supported forms:
+      - list/tuple/set: ["dataset_a", "dataset_b"]
+      - string: "dataset_a" or "all"/"*"
+      - dict: {"datasets": [...]} or {"include": [...]}
+    """
+    if config_value is None:
+        return []
+
+    raw = config_value
+    if isinstance(config_value, dict):
+        if "datasets" in config_value:
+            raw = config_value["datasets"]
+        elif "include" in config_value:
+            raw = config_value["include"]
+        else:
+            raw = []
+
+    if isinstance(raw, str):
+        raw = [raw]
+    elif isinstance(raw, (tuple, set)):
+        raw = list(raw)
+    elif not isinstance(raw, list):
+        raw = []
+
+    wanted = []
+    for item in raw:
+        ds = str(item).strip()
+        if not ds:
+            continue
+        if ds in ("*", "all", "ALL"):
+            return list(available_datasets)
+        wanted.append(ds)
+
+    # keep only configured datasets and preserve original config order
+    wanted_set = set(wanted)
+    return [ds for ds in available_datasets if ds in wanted_set]
 
 
 def _parse_model_spec(model_spec):
@@ -147,7 +213,10 @@ def _choose_fixed_visual_inputs(loader_name, max_ids_per_image=16, n=6):
     for identity in ids:
         images = loader.get_image_paths(identity)[:max_ids_per_image]
         if len(images) >= 2:
-            candidates.append(str(images[0]))
+            # Only pin fixed visual queries for path-backed datasets.
+            # Some loaders return in-memory numpy arrays, which are not stable/path-like.
+            if isinstance(images[0], (str, os.PathLike)):
+                candidates.append(str(images[0]))
     return _select_equally_spaced(candidates, n)
 
 
@@ -180,6 +249,43 @@ def _build_query_gallery_split(entries, max_queries_per_id=1):
     query_set = set(query_indices)
     gallery_indices = [i for i in range(len(entries)) if i not in query_set]
     return np.array(query_indices, dtype=np.int64), np.array(gallery_indices, dtype=np.int64)
+
+
+def _add_grid_mean_rows(rows):
+    """
+    Add display-only rows with grid='mean' that average metrics across grid variants
+    for the same dataset + compact test label.
+    """
+    base_rows = [r for r in rows if str(r.get("grid", "")).lower() != "mean"]
+    grouped = {}
+    for row in base_rows:
+        key = (row.get("dataset", ""), row.get("test_short", ""))
+        grouped.setdefault(key, []).append(row)
+
+    mean_rows = []
+    for (dataset_name, test_short), group_rows in grouped.items():
+        if len(group_rows) < 2:
+            continue
+        numeric_keys = sorted(
+            {
+                k
+                for row in group_rows
+                for k, v in row.items()
+                if isinstance(v, float)
+            }
+        )
+        mean_row = {
+            "dataset": dataset_name,
+            "test_short": test_short,
+            "test": test_short,
+            "grid": "mean",
+        }
+        for key in numeric_keys:
+            vals = [row[key] for row in group_rows if isinstance(row.get(key), float)]
+            mean_row[key] = float(np.mean(vals)) if len(vals) > 0 else 0.0
+        mean_row["vis_dir"] = ""
+        mean_rows.append(mean_row)
+    return rows + mean_rows
 
 
 def _save_query_visuals(
@@ -229,7 +335,7 @@ def _save_query_visuals(
         best_g = [int(gallery_indices[j]) for j in order[:topk]]
 
         tiles = []
-        q_img = cv2.imread(str(q_entry["image"]))
+        q_img = _image_to_bgr(q_entry["image"])
         if q_img is None:
             q_img = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
         q_img = cv2.resize(q_img, (cell_w, cell_h))
@@ -238,7 +344,7 @@ def _save_query_visuals(
 
         for rank, gidx in enumerate(best_g, start=1):
             g = entries[gidx]
-            img = cv2.imread(str(g["image"]))
+            img = _image_to_bgr(g["image"])
             if img is None:
                 img = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
             img = cv2.resize(img, (cell_w, cell_h))
@@ -271,26 +377,31 @@ def test(model_spec, grid_cols=5, grid_rows=4, min_conf=0.05, rc=None, datasets=
     reid_model = None
     inf = None
     try:
-        if reid_model_pt is not None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            state_dict = torch.load(reid_model_pt, map_location="cpu")
-            reid_model = _build_reid_adapter_from_state_dict(state_dict, device)
-
-        inf = stuff.inference_wrapper(runtime_model_spec, thr=min_conf, get_feats=True, fold_attributes=True)
-        inf.grid_cols = grid_cols
-        inf.grid_rows = grid_rows
-
         model_name = os.path.basename(base_model_path)
+        grid_label = f"{grid_cols}x{grid_rows}"
         test_name = f"{model_name} std-qg-v1 grid:{grid_cols}x{grid_rows}"
         if reid_model_pt is not None:
             test_name += f" {os.path.basename(reid_model_pt)}"
         test_short = _build_compact_test_label(base_model_path, reid_model_pt, grid_cols, grid_rows)
 
+        def ensure_models_loaded():
+            nonlocal reid_model, inf
+            if inf is not None:
+                return
+            if reid_model_pt is not None:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                state_dict = torch.load(reid_model_pt, map_location="cpu")
+                reid_model = _build_reid_adapter_from_state_dict(state_dict, device)
+            inf = stuff.inference_wrapper(runtime_model_spec, thr=min_conf, get_feats=True, fold_attributes=True)
+            inf.grid_cols = grid_cols
+            inf.grid_rows = grid_rows
+
         results = []
         for loader_name in datasets:
-            fixed_visual_inputs = _choose_fixed_visual_inputs(loader_name, max_ids_per_image=16, n=6)
             result = rc.get({"dataset": loader_name, "test": test_name})
             if result is None:
+                ensure_models_loaded()
+                fixed_visual_inputs = _choose_fixed_visual_inputs(loader_name, max_ids_per_image=16, n=6)
                 ids, all_images, entries = _collect_embeddings_for_dataset(
                     loader_name=loader_name,
                     inf=inf,
@@ -303,6 +414,7 @@ def test(model_spec, grid_cols=5, grid_rows=4, min_conf=0.05, rc=None, datasets=
                     "dataset": loader_name,
                     "test": test_name,
                     "test_short": test_short,
+                    "grid": grid_label,
                     "num_ids": float(len(ids)),
                     "num_img": float(len(all_images)),
                     "num_missed": float(len(all_images) - len(entries)),
@@ -370,15 +482,15 @@ def test(model_spec, grid_cols=5, grid_rows=4, min_conf=0.05, rc=None, datasets=
                     result["vis_inputs"] = ",".join([os.path.basename(p) for p in fixed_visual_inputs[:6]])
 
                 rc.add(result)
-            elif "test_short" not in result:
-                # Backfill for older cache entries created before compact display label.
-                result["test_short"] = test_short
+            # Keep display-only fields in sync even for older cached metric rows.
+            result["test_short"] = test_short
+            result["grid"] = grid_label
             results.append(result)
 
         if len(results) == 0:
             return results
 
-        mean_row = {"dataset": "Mean", "test": test_name, "test_short": test_short}
+        mean_row = {"dataset": "Mean", "test": test_name, "test_short": test_short, "grid": grid_label}
         numeric_keys = [k for k, v in results[0].items() if isinstance(v, float)]
         for k in numeric_keys:
             vals = [r[k] for r in results]
@@ -406,8 +518,17 @@ if __name__ == "__main__":
     datasets=config["datasets"]
     results_cache_file=config["results_cache_file"]
     visual_root = config.get("visual_output_dir", "/mldata/results/reid/query_gallery_visuals")
+    regenerate_datasets = _parse_regenerate_datasets(config.get("regenerate_datasets"), datasets)
 
     rc=stuff.ResultCache(results_cache_file)
+    if len(regenerate_datasets) > 0:
+        total_deleted = 0
+        for dataset_name in regenerate_datasets:
+            total_deleted += rc.delete({"dataset": dataset_name})
+        print(
+            f"Regenerated datasets requested: {', '.join(regenerate_datasets)} "
+            f"(removed {total_deleted} cached rows)"
+        )
 
     grids=[tuple(x) for x in config["grids"]]
     dataset_order = {name: idx for idx, name in enumerate(datasets)}
@@ -427,8 +548,9 @@ if __name__ == "__main__":
     for grid_w,grid_h in grids:
         for model in models:
             results += test(model, grid_w, grid_h, rc=rc, datasets=datasets, visual_root=visual_root)
+            display_results = _add_grid_mean_rows(results)
 
-            stuff.show_data(results,
-                            columns=["dataset","test_short","num_ids","num_img","num_missed","num_emb","num_query_total","num_query_valid","Rank-1","Rank-5","Rank-10","Rank-20","mAP","vis_count"],
-                            column_text=["dataset","test","Num id","Num Img","Missed","Emb","Q total","Q valid","Rank-1","Rank-5","Rank-10","Rank-20","mAP","Vis"],
+            stuff.show_data(display_results,
+                            columns=["dataset","test_short","grid","num_ids","num_img","num_missed","num_emb","num_query_total","num_query_valid","Rank-1","Rank-5","Rank-10","Rank-20","mAP","vis_count"],
+                            column_text=["dataset","test","grid","Num id","Num Img","Missed","Emb","Q total","Q valid","Rank-1","Rank-5","Rank-10","Rank-20","mAP","Vis"],
                             sort_fn=sort_fn)

@@ -57,6 +57,7 @@ python reid_pipeline.py \
   [--config reid.yaml] \
   [--project /path/to/output_root] \
   [--name run_name] \
+  [--max-processes N] \
   [--test] \
   [--force]
 ```
@@ -71,6 +72,7 @@ python reid_pipeline.py \
 - `--config`: YAML/JSON user config (datasets, train hyperparameters, optional overrides).
 - `--project`: output root override.
 - `--name`: run folder name override.
+- `--max-processes N`: cap the number of dataset-generation worker processes (caps `num_workers` from config).
 - `--test`: smoke mode (few hundred images, short training).
 - `--force`: re-run stage even if artifact already exists.
 
@@ -142,8 +144,15 @@ Adapter training uses triplet-style metric learning over extracted detection fea
 - dataset build stage creates feature/identity pairs from multiple ReID loaders
 - train stage optimizes adapter parameters to bring same-ID vectors closer and different-ID vectors farther
 - training settings are controlled by config (`train.*` fields: epochs, batch size, learning rate, patience, augmentation knobs)
+- adapter architecture can be adjusted via top-level config keys `hidden1`, `hidden2`, `emb` (defaults: 160, 192, 80)
 
 The detector backbone/head remains fixed during adapter training; only adapter weights are learned.
+
+`reid_train_triplet.py` can also be run standalone against a pre-built `.npz` dataset:
+
+```bash
+python reid_train_triplet.py --config /mldata/config/reid/reid_train.yaml
+```
 
 ### Fusion
 
@@ -178,27 +187,36 @@ Example:
 project: /mldata/reid_runs
 
 datasets:
-  loaders: [LastLoader, CUHKLoader, IUSTLoader, LPWLoader]
-  max_ids_per_image: 8
-  # Optional: cap IDs per loader (useful for smoke/quick runs)
-  # max_ids_per_loader: 80
+  loaders: [UbonSyntheticLoader, CUHKLoader, IUSTLoader, LPWLoader]
+  max_ids_per_image: 16
+  # Optional: cap IDs per loader (useful for quick runs)
+  # max_ids_per_loader: 200
 
-yolo_batch_size: 64
-num_workers: 4
+yolo_batch_size: 16   # grids per YOLO call; lower if OOM during dataset build
+num_workers: 4        # parallel dataset-build processes
 
 train:
-  epochs: 80
-  batch_size: 128
+  epochs: 100
+  batch_size: 4096    # triplet training batch size (features are in-memory)
   lr0: 0.01
   patience: 10
-  augmentations: 3
-  aug_rotate: 0
-  aug_effects: 0
+  augmentations: 15   # extra augmented copies per image during dataset build
+  aug_rotate: 0.1
+  aug_effects: 0.8    # probability to apply post-grid Albumentations effects
+  albumentations_set: standard   # standard | aggressive_motion | none
+  # Optional per-loader overrides (keys match loader names, case-insensitive)
+  loader_augmentations:
+    UbonSyntheticLoader:
+      augmentations: 20
+      aug_rotate: 0.2
+      aug_effects: 0.95
+      albumentations_set: aggressive_motion
 
 # Optional overrides:
-# reid_yaml: /path/to/manual_posereid_yaml.yaml
-# fuse_test_image: /path/to/image.jpg
-# sanity_image: /path/to/image.jpg
+# reid_yaml: /path/to/manual_posereid_yaml.yaml   # explicit YAML instead of in-place head promotion
+# fuse_test_image: /path/to/image.jpg             # image for fuse sanity check
+# sanity_image: /path/to/image.jpg               # image for sanity stage (falls back to fuse_test_image)
+# train_aug_preview_count_per_loader: 12         # number of post-augmentation preview grids to save per train loader
 ```
 
 ---
@@ -253,6 +271,7 @@ Supported loader names:
 - `CUHKLoader`
 - `LPWLoader`
 - `IUSTLoader`
+- `UbonSyntheticLoader` (splits each 4x4 synthetic grid into 16 BGR subimages per ID)
 
 Loaders live in `src/loaders/` and provide:
 

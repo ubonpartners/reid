@@ -6,12 +6,14 @@ import src.loaders.last_loader as last_loader
 import src.loaders.cuhk_loader as cuhk_loader
 import src.loaders.lpw_loader as lpw_loader
 import src.loaders.iust_loader as iust_loader
+import src.loaders.ubon_synthetic_loader as ubon_synthetic_loader
 
 _LOADER_REGISTRY = {
     "lastloader": last_loader.LastLoader,
     "cuhkloader": cuhk_loader.CUHKLoader,
     "lpwloader": lpw_loader.LPWLoader,
     "iustloader": iust_loader.IUSTLoader,
+    "ubonsyntheticloader": ubon_synthetic_loader.UbonSyntheticLoader,
 }
 
 

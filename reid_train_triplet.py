@@ -25,6 +25,23 @@ class TripletReIDDataset(Dataset):
             idx for idx, label in enumerate(self.labels)
             if len(self.label_to_indices[label]) > 1
         ]
+        # Cache the list of valid negative labels for O(1) sampling
+        self._all_labels = list(self.label_to_indices.keys())
+
+    def _ensure_internal_state(self):
+        """
+        Defensive repair for cases where worker-side dataset state is stale/incomplete
+        (e.g. old pickled instances or version-skew during long runs).
+        """
+        if not hasattr(self, "label_to_indices") or self.label_to_indices is None:
+            self.label_to_indices = self._build_label_index()
+        if not hasattr(self, "valid_indices") or self.valid_indices is None:
+            self.valid_indices = [
+                idx for idx, label in enumerate(self.labels)
+                if len(self.label_to_indices[label]) > 1
+            ]
+        if not hasattr(self, "_all_labels") or not self._all_labels:
+            self._all_labels = list(self.label_to_indices.keys())
 
     def _build_label_index(self):
         label_to_indices = {}
@@ -33,9 +50,11 @@ class TripletReIDDataset(Dataset):
         return label_to_indices
 
     def __len__(self):
+        self._ensure_internal_state()
         return len(self.valid_indices)
 
     def __getitem__(self, i):
+        self._ensure_internal_state()
         idx = self.valid_indices[i]
         anchor_feat = self.features[idx]  # np.ndarray
         anchor_label = self.labels[idx]
@@ -45,7 +64,9 @@ class TripletReIDDataset(Dataset):
             pos_idx = random.choice(self.label_to_indices[anchor_label])
         pos_feat = self.features[pos_idx]
 
-        neg_label = random.choice([l for l in self.label_to_indices if l != anchor_label])
+        neg_label = anchor_label
+        while neg_label == anchor_label:
+            neg_label = random.choice(self._all_labels)
         neg_feat = self.features[random.choice(self.label_to_indices[neg_label])]
 
         return (
@@ -59,14 +80,15 @@ def train_triplet_model(train_feats, train_labels,
                         batch_size=128, lr=1e-2, epochs=50,
                         patience=10,
                         device="cuda", output="out.pth",
-                        margin_start=0.01, margin_end=0.35):
+                        margin_start=0.01, margin_end=0.35,
+                        hidden1=160, hidden2=192, emb=80):
 
     train_ds = TripletReIDDataset(train_feats, train_labels)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=8, pin_memory=True)
-    in_dim=train_feats[0].shape[0]
-    print(f"Training in embedding feature size is {in_dim} - should be 520+nc")
-    model = ReIDAdapter(in_dim=in_dim, hidden1=160, hidden2=192, emb=80).to(device)
-    #optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Dataset is in-memory; extra workers only add IPC overhead.
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0, pin_memory=False)
+    in_dim = train_feats[0].shape[0]
+    print(f"ReIDAdapter in_dim={in_dim}  hidden=({hidden1},{hidden2})  emb={emb}")
+    model = ReIDAdapter(in_dim=in_dim, hidden1=hidden1, hidden2=hidden2, emb=emb).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # Chainable warmup+cosine scheduler without SequentialLR to avoid
@@ -93,6 +115,7 @@ def train_triplet_model(train_feats, train_labels,
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0
+        counted_samples = 0
         valid_triplets = 0
 
         # Annealed margin for this epoch
@@ -118,11 +141,13 @@ def train_triplet_model(train_feats, train_labels,
             loss = (F.relu(d_ap - d_an + margin) * mask).sum() / mask.sum()
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item() * anchor.size(0)
+            counted_samples += anchor.size(0)
             valid_triplets += mask.sum().item()
 
-        avg_loss = total_loss / len(train_loader.dataset)
+        avg_loss = total_loss / max(1, counted_samples)
         scheduler.step()
 
         recalls = reid_eval.evaluate_recall_faiss(model, val_feats, val_labels, device=device, name="val", do_print=False)
@@ -139,7 +164,7 @@ def train_triplet_model(train_feats, train_labels,
             best_epoch=epoch
             torch.save(model.state_dict(), output)
         print(txt)
-        if epoch>best_epoch+patience:
+        if epoch >= best_epoch + patience:
             print(f"Stopping training at epoch {epoch} as no improvement in last {patience} epochs")
             break
 
@@ -170,9 +195,6 @@ if __name__ == "__main__":
     val_feats=data["val_feats"]
     val_labels=data["val_labels"]
 
-    #for v in arrays:
-    #    print(f"data {v} {len(data[v])}")
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = train_triplet_model(feats,
                                 labels,
@@ -183,7 +205,10 @@ if __name__ == "__main__":
                                 patience=config.get("train_patience", 10),
                                 batch_size=batch_size,
                                 lr=config.get("train_lr0", 0.01),
-                                output=config["reid_model"])
+                                output=config["reid_model"],
+                                hidden1=config.get("hidden1", 160),
+                                hidden2=config.get("hidden2", 192),
+                                emb=config.get("emb", 80))
     print("evaluate recall...")
     for v in arrays:
         if v.startswith("val") and v.endswith("_labels"):
@@ -201,3 +226,4 @@ if __name__ == "__main__":
 
 #Yolo26l
 #Epoch 55 - Triplet Loss: 0.1947 - Margin: 0.195 - LR: 2.29e-03 - Triplets used: 196852 R@1=0.5139 R@5=0.7309 R@10=0.8043 R@20=0.8669 AVG=0.7290 **NEW BEST** 0.7290
+#Epoch 86 - Triplet Loss: 0.2997 - Margin: 0.302 - LR: 5.26e-04 - Triplets used: 138285 R@1=0.5863 R@5=0.7906 R@10=0.8530 R@20=0.9027 AVG=0.7832 **NEW BEST** 0.7832

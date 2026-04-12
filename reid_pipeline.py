@@ -20,19 +20,20 @@ import src.reid_model as reid_model
 DEFAULT_CONFIG = {
     "project": str(Path(__file__).resolve().parent / "runs"),
     "datasets": {
-        "loaders": ["LastLoader", "CUHKLoader", "IUSTLoader", "LPWLoader"],
-        "max_ids_per_image": 8,
+        "loaders": ["ubonsyntheticloader","CUHKLoader", "IUSTLoader", "LPWLoader"],
+        "max_ids_per_image": 16,
     },
-    "yolo_batch_size": 64,
+    "yolo_batch_size": 16,
     "num_workers": 4,
     "train": {
-        "epochs": 80,
-        "batch_size": 128,
+        "epochs": 100,
+        "batch_size": 4096,
         "lr0": 0.01,
         "patience": 10,
-        "augmentations": 3,
-        "aug_rotate": 0,
-        "aug_effects": 0,
+        "augmentations": 15,
+        "aug_rotate": 0.1,
+        "aug_effects": 0.8,
+        "albumentations_set": "standard",
     },
 }
 
@@ -108,20 +109,24 @@ def build_resolved_config(cfg, base_model_path, paths):
     return {
         "project": cfg["project"],
         "datasets": cfg["datasets"],
-        "yolo_batch_size": cfg.get("yolo_batch_size", 64),
-        "num_workers": cfg.get("num_workers", 4),
+        "yolo_batch_size": cfg.get("yolo_batch_size", 32),
+        "num_workers": cfg.get("num_workers", 6),
         "yolo_model": base_model_path,
         "reid_dataset": paths["dataset"],
         "reid_model": paths["adapter"],
         "reid_yolo_model": paths["fused_pt"],
         "reid_onnx_model": paths["fused_onnx"],
-        "train_epochs": train_cfg.get("epochs", 80),
-        "train_batch_size": train_cfg.get("batch_size", 128),
+        "train_epochs": train_cfg.get("epochs", 100),
+        "train_batch_size": train_cfg.get("batch_size", 4096),
         "train_lr0": train_cfg.get("lr0", 0.01),
         "train_patience": train_cfg.get("patience", 10),
-        "train_augmentations": train_cfg.get("augmentations", 3),
+        "train_augmentations": train_cfg.get("augmentations", 15),
         "train_aug_rotate": train_cfg.get("aug_rotate", 0),
         "train_aug_effects": train_cfg.get("aug_effects", 0),
+        "train_albumentations_set": train_cfg.get("albumentations_set", "standard"),
+        "train_loader_augmentations": train_cfg.get("loader_augmentations", {}),
+        "train_aug_preview_dir": str(Path(paths["run_dir"]) / "aug_preview"),
+        "train_aug_preview_count_per_loader": int(cfg.get("train_aug_preview_count_per_loader", 12)),
         # Optional manual override remains supported.
         "reid_yaml": cfg.get("reid_yaml"),
         "fuse_test_image": cfg.get("fuse_test_image"),
@@ -144,6 +149,8 @@ def apply_test_mode(cfg):
     cfg["train"]["augmentations"] = 0
     cfg["train"]["aug_rotate"] = 0
     cfg["train"]["aug_effects"] = 0
+    cfg["train"]["albumentations_set"] = "none"
+    cfg["train_aug_preview_count_per_loader"] = min(int(cfg.get("train_aug_preview_count_per_loader", 4)), 4)
     return cfg
 
 
@@ -175,8 +182,18 @@ def run_build_dataset(resolved, manifest):
     # Pick a deterministic sanity image for fuse-check when not provided.
     if not resolved.get("fuse_test_image"):
         for key in ("val", "train"):
-            if key in datasets and len(datasets[key]) and len(datasets[key][0]):
-                resolved["fuse_test_image"] = datasets[key][0][0]
+            if key not in datasets:
+                continue
+            for identity_imgs in datasets[key]:
+                for candidate in identity_imgs:
+                    # Some loaders (e.g. ubon synthetic) return in-memory ndarrays.
+                    # fuse_test_image must be a filesystem path for later YOLO sanity step.
+                    if isinstance(candidate, str):
+                        resolved["fuse_test_image"] = candidate
+                        break
+                if resolved.get("fuse_test_image"):
+                    break
+            if resolved.get("fuse_test_image"):
                 break
     _, metadata = reid_dataset.make_reid_feats(config=resolved, datasets=datasets, save=True)
     manifest["stages"]["build-dataset"] = {
