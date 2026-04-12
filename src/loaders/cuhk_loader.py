@@ -3,6 +3,15 @@ import logging
 from src.loaders.common import group_by_prefix, numpy_split_list
 
 class CUHKLoader:
+    @classmethod
+    def get_train_augmentation_defaults(cls):
+        return {
+            "num_aug": 15,
+            "rotate_prob": 0.1,
+            "effect_prob": 0.8,
+            "albumentations_set": "standard",
+        }
+
     def __init__(self,
                  task="val",
                  cukh_path="/mldata/downloaded_datasets/reid/cuhk03"):

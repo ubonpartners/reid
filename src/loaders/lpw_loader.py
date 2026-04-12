@@ -3,6 +3,15 @@ import logging
 from src.loaders.common import numpy_split_list
 
 class LPWLoader:
+    @classmethod
+    def get_train_augmentation_defaults(cls):
+        return {
+            "num_aug": 15,
+            "rotate_prob": 0.1,
+            "effect_prob": 0.8,
+            "albumentations_set": "standard",
+        }
+
     def __init__(self,
                  task="val",
                  lpw_path="/mldata/downloaded_datasets/reid/LPW"):
