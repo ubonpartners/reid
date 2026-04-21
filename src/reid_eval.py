@@ -3,6 +3,72 @@ import numpy as np
 import faiss
 
 
+def evaluate_dprime(model, features, labels, device="cuda", max_samples=4096, name="??", do_print=False):
+    """
+    Compute d-prime (Cohen's d) on the same-identity vs cross-identity cosine
+    distribution. This is the calibration-sensitive metric (§9.1 / §12.1 of
+    UTRACK_REVIEW.md): two models with identical R@1 can have very different
+    additive contribution to the tracker's cost, and d-prime captures that.
+
+        d' = (mean(cos_pos) - mean(cos_neg)) / sqrt((var_pos + var_neg) / 2)
+
+    Computed on up to `max_samples` embeddings to keep the pairwise cost bounded.
+
+    Returns dict with d_prime, pos_mean, neg_mean, pos_std, neg_std, n_pos_pairs,
+    n_neg_pairs.
+    """
+    feats_tensor = torch.tensor(features.astype(np.float32)).to(device)
+    if model is None:
+        embeddings = feats_tensor.cpu().numpy()
+    else:
+        model.eval()
+        with torch.no_grad():
+            embeddings = model(feats_tensor).cpu().numpy()
+
+    N = embeddings.shape[0]
+    if N > max_samples:
+        rng = np.random.default_rng(0)
+        keep = rng.choice(N, size=max_samples, replace=False)
+        embeddings = embeddings[keep]
+        labels = np.asarray(labels)[keep]
+    else:
+        labels = np.asarray(labels)
+
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embeddings = embeddings / (norms + 1e-10)
+    cos = embeddings @ embeddings.T
+
+    same = labels[:, None] == labels[None, :]
+    iu = np.triu_indices(cos.shape[0], k=1)
+    same_u = same[iu]
+    cos_u = cos[iu]
+
+    pos = cos_u[same_u]
+    neg = cos_u[~same_u]
+
+    if pos.size < 2 or neg.size < 2:
+        out = {"d_prime": 0.0, "pos_mean": 0.0, "neg_mean": 0.0,
+               "pos_std": 0.0, "neg_std": 0.0,
+               "n_pos_pairs": int(pos.size), "n_neg_pairs": int(neg.size)}
+        if do_print:
+            print(f"[{name}] d-prime: insufficient pairs (pos={pos.size}, neg={neg.size})")
+        return out
+
+    pos_mean, pos_std = float(pos.mean()), float(pos.std())
+    neg_mean, neg_std = float(neg.mean()), float(neg.std())
+    pooled = (pos_std**2 + neg_std**2) / 2.0
+    d_prime = (pos_mean - neg_mean) / (np.sqrt(pooled) + 1e-10)
+
+    if do_print:
+        print(f"[{name}] d-prime={d_prime:.3f}  pos={pos_mean:.3f}±{pos_std:.3f}  "
+              f"neg={neg_mean:.3f}±{neg_std:.3f}  gap={pos_mean-neg_mean:.3f}")
+
+    return {"d_prime": float(d_prime),
+            "pos_mean": pos_mean, "neg_mean": neg_mean,
+            "pos_std": pos_std, "neg_std": neg_std,
+            "n_pos_pairs": int(pos.size), "n_neg_pairs": int(neg.size)}
+
+
 def evaluate_recall_faiss(model, features, labels, device="cuda", ks=(1, 5, 10, 20), name="??", do_print=True):
     """
     Compute Recall@K using FAISS inner-product search on L2-normalised embeddings
