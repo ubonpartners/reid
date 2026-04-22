@@ -6,7 +6,7 @@ import src.reid_eval as reid_eval
 import numpy as np
 from functools import partial
 from ultralytics import YOLO
-from ultralytics.nn.modules.head import ReIDAdapter
+from ultralytics.nn.modules.head import build_reid_adapter_from_state_dict
 from tqdm import tqdm
 import torch
 import json
@@ -90,6 +90,127 @@ def _apply_post_aug_image(img, effect_prob, albumentations_set):
     return transform(image=img_np)["image"]
 
 
+def _coerce_float(value, default):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _coerce_int(value, default):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+def _apply_grid_random_erasing(img, grid_boxes, aug_cfg):
+    prob = _clamp(_coerce_float(aug_cfg.get("random_erasing_prob", 0.0), 0.0), 0.0, 1.0)
+    if prob <= 0.0 or random.random() >= prob:
+        return img
+    if grid_boxes is None or len(grid_boxes) == 0:
+        return img
+
+    per_box_prob = _clamp(_coerce_float(aug_cfg.get("random_erasing_per_box_prob", 0.35), 0.35), 0.0, 1.0)
+    min_area = _clamp(_coerce_float(aug_cfg.get("random_erasing_min_area", 0.02), 0.02), 0.0001, 1.0)
+    max_area = _clamp(_coerce_float(aug_cfg.get("random_erasing_max_area", 0.12), 0.12), min_area, 1.0)
+    min_aspect = _clamp(_coerce_float(aug_cfg.get("random_erasing_min_aspect", 0.5), 0.5), 0.1, 10.0)
+    max_aspect = _clamp(_coerce_float(aug_cfg.get("random_erasing_max_aspect", 2.0), 2.0), min_aspect, 10.0)
+    max_regions = max(1, _coerce_int(aug_cfg.get("random_erasing_max_regions", 1), 1))
+    max_attempts = max(1, _coerce_int(aug_cfg.get("random_erasing_max_attempts", 10), 10))
+    min_side = max(2, _coerce_int(aug_cfg.get("random_erasing_min_side", 8), 8))
+    fill_mode = str(aug_cfg.get("random_erasing_fill_mode", "mean")).strip().lower()
+    if fill_mode not in {"mean", "random", "constant", "black"}:
+        fill_mode = "mean"
+    fill_value = _clamp(_coerce_float(aug_cfg.get("random_erasing_fill_value", 0), 0), 0.0, 255.0)
+
+    img_np = np.asarray(img).copy()
+    if img_np.ndim < 2:
+        return img
+
+    height, width = img_np.shape[:2]
+    if height < min_side or width < min_side:
+        return img
+
+    def _draw_patch(er_h, er_w):
+        if fill_mode == "mean":
+            return None
+        if fill_mode == "constant":
+            if img_np.ndim == 2:
+                return np.array(fill_value, dtype=img_np.dtype)
+            return np.full((er_h, er_w, img_np.shape[2]), fill_value, dtype=img_np.dtype)
+        if fill_mode == "black":
+            if img_np.ndim == 2:
+                return np.array(0, dtype=img_np.dtype)
+            return np.zeros((er_h, er_w, img_np.shape[2]), dtype=img_np.dtype)
+        if img_np.ndim == 2:
+            patch = np.random.randint(0, 256, size=(er_h, er_w), dtype=np.uint8)
+        else:
+            patch = np.random.randint(0, 256, size=(er_h, er_w, img_np.shape[2]), dtype=np.uint8)
+        if img_np.dtype != np.uint8:
+            patch = patch.astype(img_np.dtype)
+        return patch
+
+    applied = False
+    for box in grid_boxes:
+        if box is None or len(box) != 4:
+            continue
+        if random.random() >= per_box_prob:
+            continue
+
+        x1 = _clamp(int(round(float(box[0]) * width)), 0, width - 1)
+        y1 = _clamp(int(round(float(box[1]) * height)), 0, height - 1)
+        x2 = _clamp(int(round(float(box[2]) * width)), 0, width)
+        y2 = _clamp(int(round(float(box[3]) * height)), 0, height)
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw < min_side or bh < min_side:
+            continue
+
+        box_area = float(bw * bh)
+        for _ in range(max_regions):
+            placed = False
+            for _ in range(max_attempts):
+                target_area = random.uniform(min_area, max_area) * box_area
+                aspect = random.uniform(min_aspect, max_aspect)
+                er_w = int(round(np.sqrt(target_area * aspect)))
+                er_h = int(round(np.sqrt(target_area / max(aspect, 1e-6))))
+                if er_w < min_side or er_h < min_side:
+                    continue
+                if er_w >= bw or er_h >= bh:
+                    continue
+
+                ex1 = random.randint(x1, x2 - er_w)
+                ey1 = random.randint(y1, y2 - er_h)
+                ex2 = ex1 + er_w
+                ey2 = ey1 + er_h
+
+                fill_patch = _draw_patch(er_h, er_w)
+                if fill_patch is None:
+                    source = img_np[y1:y2, x1:x2]
+                    if source.size == 0:
+                        continue
+                    if img_np.ndim == 2:
+                        fill_patch = np.array(source.mean(), dtype=img_np.dtype)
+                    else:
+                        fill_patch = source.reshape(-1, source.shape[2]).mean(axis=0).astype(img_np.dtype)
+
+                img_np[ey1:ey2, ex1:ex2] = fill_patch
+                applied = True
+                placed = True
+                break
+            if not placed:
+                break
+
+    if not applied:
+        return img
+    return img_np
+
+
 def _normalize_aug_policy(policy):
     if not isinstance(policy, dict):
         return {}
@@ -100,6 +221,37 @@ def _normalize_aug_policy(policy):
         out["rotate_prob"] = out["aug_rotate"]
     if "aug_effects" in out and "effect_prob" not in out:
         out["effect_prob"] = out["aug_effects"]
+    if "aug_random_erasing" in out and "random_erasing_prob" not in out:
+        out["random_erasing_prob"] = out["aug_random_erasing"]
+    if "erase_prob" in out and "random_erasing_prob" not in out:
+        out["random_erasing_prob"] = out["erase_prob"]
+    if "random_erasing" in out:
+        re_cfg = out["random_erasing"]
+        if isinstance(re_cfg, dict):
+            re_aliases = {
+                "prob": "random_erasing_prob",
+                "per_box_prob": "random_erasing_per_box_prob",
+                "min_area": "random_erasing_min_area",
+                "max_area": "random_erasing_max_area",
+                "min_aspect": "random_erasing_min_aspect",
+                "max_aspect": "random_erasing_max_aspect",
+                "max_regions": "random_erasing_max_regions",
+                "max_attempts": "random_erasing_max_attempts",
+                "min_side": "random_erasing_min_side",
+                "fill_mode": "random_erasing_fill_mode",
+                "fill_value": "random_erasing_fill_value",
+            }
+            for src_key, dst_key in re_aliases.items():
+                if src_key in re_cfg and dst_key not in out:
+                    out[dst_key] = re_cfg[src_key]
+        elif "random_erasing_prob" not in out:
+            out["random_erasing_prob"] = re_cfg
+    area_pair = out.get("random_erasing_area")
+    if isinstance(area_pair, (list, tuple)) and len(area_pair) == 2:
+        if "random_erasing_min_area" not in out:
+            out["random_erasing_min_area"] = area_pair[0]
+        if "random_erasing_max_area" not in out:
+            out["random_erasing_max_area"] = area_pair[1]
     return out
 
 
@@ -279,6 +431,7 @@ def make_feat_process_batch_work(model, batch_work):
                                              max_random_shrink=0.5,
                                              aug_rotate=w["aug_rotate"],
                                              aug_effects=0)
+        img = _apply_grid_random_erasing(img, grid_boxes, w)
         img = _apply_post_aug_image(
             img,
             effect_prob=float(w.get("aug_effect_prob", 0)),
@@ -306,6 +459,17 @@ def make_model(args):
 def get_feats(img_list, id_list_in, index_list_in, model_name,
               name, batch_size=64, num_aug=0,
               aug_rotate=False, aug_effect_prob=0, albumentations_set="standard",
+              random_erasing_prob=0.0,
+              random_erasing_per_box_prob=0.35,
+              random_erasing_min_area=0.02,
+              random_erasing_max_area=0.12,
+              random_erasing_min_aspect=0.5,
+              random_erasing_max_aspect=2.0,
+              random_erasing_max_regions=1,
+              random_erasing_max_attempts=10,
+              random_erasing_min_side=8,
+              random_erasing_fill_mode="mean",
+              random_erasing_fill_value=0,
               num_workers=1, num_classes=40,
               debug_feature_stats=False,
               mp_min_work_items=6,
@@ -350,7 +514,18 @@ def get_feats(img_list, id_list_in, index_list_in, model_name,
                          "img_size":img_size,
                          "aug_rotate":aug_rotate,
                          "aug_effect_prob":aug_effect_prob,
-                         "albumentations_set":albumentations_set}
+                         "albumentations_set":albumentations_set,
+                         "random_erasing_prob":random_erasing_prob,
+                         "random_erasing_per_box_prob":random_erasing_per_box_prob,
+                         "random_erasing_min_area":random_erasing_min_area,
+                         "random_erasing_max_area":random_erasing_max_area,
+                         "random_erasing_min_aspect":random_erasing_min_aspect,
+                         "random_erasing_max_aspect":random_erasing_max_aspect,
+                         "random_erasing_max_regions":random_erasing_max_regions,
+                         "random_erasing_max_attempts":random_erasing_max_attempts,
+                         "random_erasing_min_side":random_erasing_min_side,
+                         "random_erasing_fill_mode":random_erasing_fill_mode,
+                         "random_erasing_fill_value":random_erasing_fill_value}
         batch_work.append(batch_work_item)
         if len(batch_work)>=batch_size:
             work_items.append(batch_work)
@@ -426,6 +601,17 @@ def _resolve_train_loader_policies(config):
         "rotate_prob": float(config.get("train_aug_rotate", 0)),
         "effect_prob": float(config.get("train_aug_effects", 0)),
         "albumentations_set": str(config.get("train_albumentations_set", "standard")),
+        "random_erasing_prob": float(config.get("train_random_erasing_prob", 0.0)),
+        "random_erasing_per_box_prob": float(config.get("train_random_erasing_per_box_prob", 0.35)),
+        "random_erasing_min_area": float(config.get("train_random_erasing_min_area", 0.02)),
+        "random_erasing_max_area": float(config.get("train_random_erasing_max_area", 0.12)),
+        "random_erasing_min_aspect": float(config.get("train_random_erasing_min_aspect", 0.5)),
+        "random_erasing_max_aspect": float(config.get("train_random_erasing_max_aspect", 2.0)),
+        "random_erasing_max_regions": int(config.get("train_random_erasing_max_regions", 1)),
+        "random_erasing_max_attempts": int(config.get("train_random_erasing_max_attempts", 10)),
+        "random_erasing_min_side": int(config.get("train_random_erasing_min_side", 8)),
+        "random_erasing_fill_mode": str(config.get("train_random_erasing_fill_mode", "mean")),
+        "random_erasing_fill_value": float(config.get("train_random_erasing_fill_value", 0)),
     }
 
     policies = {}
@@ -485,7 +671,7 @@ def _generate_aug_preview(datasets, dataset_name, aug_cfg, preview_dir, sample_c
         if len(imgs) == 0:
             continue
         img_size = random.choice([512, 640, 704, 768, 832, 864, 960])
-        canvas, _ = stuff.create_image_grid(
+        canvas, grid_boxes = stuff.create_image_grid(
             imgs,
             M,
             N,
@@ -495,6 +681,7 @@ def _generate_aug_preview(datasets, dataset_name, aug_cfg, preview_dir, sample_c
             aug_rotate=float(aug_cfg.get("rotate_prob", 0)),
             aug_effects=0,
         )
+        canvas = _apply_grid_random_erasing(canvas, grid_boxes, aug_cfg)
         canvas = _apply_post_aug_image(
             canvas,
             effect_prob=float(aug_cfg.get("effect_prob", 0)),
@@ -531,6 +718,17 @@ def _run_dataset_feature_extract(dataset_name, dataset_groups, config, num_class
         aug_rotate=float(aug_cfg.get("rotate_prob", 0)),
         aug_effect_prob=float(aug_cfg.get("effect_prob", 0)),
         albumentations_set=aug_cfg.get("albumentations_set", "standard"),
+        random_erasing_prob=float(aug_cfg.get("random_erasing_prob", 0.0)),
+        random_erasing_per_box_prob=float(aug_cfg.get("random_erasing_per_box_prob", 0.35)),
+        random_erasing_min_area=float(aug_cfg.get("random_erasing_min_area", 0.02)),
+        random_erasing_max_area=float(aug_cfg.get("random_erasing_max_area", 0.12)),
+        random_erasing_min_aspect=float(aug_cfg.get("random_erasing_min_aspect", 0.5)),
+        random_erasing_max_aspect=float(aug_cfg.get("random_erasing_max_aspect", 2.0)),
+        random_erasing_max_regions=int(aug_cfg.get("random_erasing_max_regions", 1)),
+        random_erasing_max_attempts=int(aug_cfg.get("random_erasing_max_attempts", 10)),
+        random_erasing_min_side=int(aug_cfg.get("random_erasing_min_side", 8)),
+        random_erasing_fill_mode=aug_cfg.get("random_erasing_fill_mode", "mean"),
+        random_erasing_fill_value=float(aug_cfg.get("random_erasing_fill_value", 0)),
         num_workers=num_workers,
         num_classes=num_classes,
         debug_feature_stats=debug_feature_stats,
@@ -794,9 +992,7 @@ def test_reid(config_yaml, val_set=None):
     model=None
     if raw:
         print(f"Using reid adapter model {config['reid_model']}")
-        model = ReIDAdapter(in_dim=in_dim).to(device)
-        model.load_state_dict(state_dict)
-        model.eval()
+        model = build_reid_adapter_from_state_dict(state_dict, device=device)
     else:
         print("No reid adapter model, using raw embeddings")
 
@@ -856,9 +1052,7 @@ def eval_reid(config_yaml):
     model=None
     if raw:
         print(f"Using reid adapter model {config['reid_model']} features {in_dim}")
-        model = ReIDAdapter(in_dim=in_dim).to(device)
-        model.load_state_dict(state_dict)
-        model.eval()
+        model = build_reid_adapter_from_state_dict(state_dict, device=device)
     else:
         print("No reid adapter model, using raw embeddings")
 

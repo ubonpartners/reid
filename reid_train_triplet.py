@@ -25,7 +25,7 @@ import stuff
 from tqdm import tqdm
 import argparse
 import src.reid_eval as reid_eval
-from ultralytics.nn.modules.head import ReIDAdapter
+from ultralytics.nn.modules.head import ReIDAdapter, ReIDAdapterV2
 from torch.optim.lr_scheduler import LambdaLR
 import warnings
 import os
@@ -291,7 +291,10 @@ def train_triplet_model(train_feats, train_labels,
                         patience=10,
                         device="cuda", output="out.pth",
                         margin_start=0.01, margin_end=0.35,
-                        hidden1=160, hidden2=192, emb=80,
+                        hidden1=160, hidden2=192, emb=96,
+                        # adapter version: 1 = legacy ReIDAdapter (fp16-unsafe),
+                        # 2 = ReIDAdapterV2 (interleaved LN, SiLU, no scale, fp16-safe)
+                        adapter_version=2,
                         # item 1: PK sampler
                         pk_P=64, pk_K=4, pk_num_batches=None,
                         # item 7: soft margin
@@ -333,7 +336,14 @@ def train_triplet_model(train_feats, train_labels,
     train_loader = DataLoader(train_ds, batch_size=effective_batch, sampler=sampler,
                               drop_last=True, num_workers=0, pin_memory=False)
 
-    print(f"ReIDAdapter in_dim={in_dim}  hidden=({hidden1},{hidden2})  emb={emb}")
+    if int(adapter_version) == 2:
+        adapter_cls = ReIDAdapterV2
+    elif int(adapter_version) == 1:
+        adapter_cls = ReIDAdapter
+    else:
+        raise ValueError(f"Unknown adapter_version: {adapter_version} (expected 1 or 2)")
+
+    print(f"{adapter_cls.__name__} in_dim={in_dim}  hidden=({hidden1},{hidden2})  emb={emb}")
     print(f"train: N={len(train_ds)}  classes={num_classes}  "
           f"PK=({pk_P},{pk_K}) -> batch={effective_batch}  batches/epoch={pk_num_batches}")
     print(f"loss: triplet({'soft' if soft_margin else 'hard'}), "
@@ -341,16 +351,23 @@ def train_triplet_model(train_feats, train_labels,
           f"xbm_enabled={xbm_enabled} size={xbm_size} start_epoch={xbm_start_epoch}  "
           f"ckpt_metric={checkpoint_metric}")
 
-    model = ReIDAdapter(in_dim=in_dim, hidden1=hidden1, hidden2=hidden2, emb=emb).to(device)
+    model = adapter_cls(in_dim=in_dim, hidden1=hidden1, hidden2=hidden2, emb=emb).to(device)
+
+    # V1 has a learnable `scale` that can collapse and force MLP weights to grow
+    # huge, overflowing fp16 at inference. Clamp it into a safe range when
+    # training V1. V2 has no scale parameter (its interleaved LN bounds every
+    # intermediate activation to O(1) regardless of weight magnitude), so the
+    # clamp is a no-op for V2.
+    SCALE_MIN, SCALE_MAX = 0.1, 20.0
 
     head = None
     if ce_enabled:
         head = BNNeckClassifier(emb_dim=emb, num_classes=num_classes,
                                 mode=ce_mode, scale=ce_scale, margin=ce_margin).to(device)
 
-    params = list(model.parameters())
+    params = [p for p in model.parameters() if p.requires_grad]
     if head is not None:
-        params += list(head.parameters())
+        params += [p for p in head.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
 
     warmup_epochs = min(5, max(1, epochs))
@@ -384,6 +401,7 @@ def train_triplet_model(train_feats, train_labels,
         total_tri = 0.0
         total_ce = 0.0
         counted = 0
+        n_nan_steps = 0
 
         hard_margin = margin_start + (epoch - 1) / max(1, epochs - 1) * (margin_end - margin_start)
         xbm_active = xbm is not None and epoch >= xbm_start_epoch
@@ -420,8 +438,25 @@ def train_triplet_model(train_feats, train_labels,
 
             optimizer.zero_grad()
             loss.backward()
+
+            # NaN guard: a single non-finite loss or grad poisons Adam's moment
+            # buffers permanently. Skip step + enqueue + stats when that happens
+            # so a transient numerical hiccup can't corrupt the run.
+            bad = (not torch.isfinite(loss)) or any(
+                p.grad is not None and not torch.isfinite(p.grad).all()
+                for p in params
+            )
+            if bad:
+                n_nan_steps += 1
+                continue
+
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimizer.step()
+
+            # Keep scale away from the fp16-overflow regime (see SCALE_MIN/MAX above).
+            if hasattr(model, "scale") and isinstance(model.scale, nn.Parameter):
+                with torch.no_grad():
+                    model.scale.clamp_(min=SCALE_MIN, max=SCALE_MAX)
 
             # Enqueue current batch embeddings (detached) for next iteration.
             if xbm is not None:
@@ -454,12 +489,17 @@ def train_triplet_model(train_feats, train_labels,
             score = score_composite
 
         lr_now = optimizer.param_groups[0]['lr']
+        scale_bit = ""
+        if hasattr(model, "scale") and isinstance(model.scale, nn.Parameter):
+            scale_bit = f" scale={float(model.scale.item()):.2f}"
         txt = (f"Epoch {epoch:02d} - L_tri={avg_tri:.4f} L_ce={avg_ce:.4f} "
-               f"LR={lr_now:.2e} "
+               f"LR={lr_now:.2e}{scale_bit} "
                + " ".join(f"{r}={recalls[r]:0.4f}" for r in recalls) +
                f" AVG={avg_recall:0.4f} d'={dp['d_prime']:.3f} "
                f"gap={dp['pos_mean']-dp['neg_mean']:.3f} "
                f"comp={score_composite:.4f}")
+        if n_nan_steps > 0:
+            txt += f" [skipped {n_nan_steps} non-finite steps]"
 
         if score > best_score:
             best_score = score
@@ -514,7 +554,8 @@ if __name__ == "__main__":
         output=config["reid_model"],
         hidden1=config.get("hidden1", 160),
         hidden2=config.get("hidden2", 192),
-        emb=config.get("emb", 80),
+        emb=config.get("emb", 96),
+        adapter_version=config.get("adapter_version", 2),
         pk_P=config.get("pk_P", 16),
         pk_K=config.get("pk_K", 4),
         pk_num_batches=config.get("pk_num_batches", None),

@@ -9,7 +9,7 @@ import numpy as np
 import stuff
 import torch
 from ultralytics import YOLO
-from ultralytics.nn.modules.head import ReIDAdapter
+from ultralytics.nn.modules.head import build_reid_adapter_from_state_dict
 
 import reid_dataset
 import reid_train_triplet
@@ -34,6 +34,18 @@ DEFAULT_CONFIG = {
         "aug_rotate": 0.1,
         "aug_effects": 0.8,
         "albumentations_set": "standard",
+        # Grid-aware random erasing (conservative defaults).
+        "random_erasing_prob": 0.50,
+        "random_erasing_per_box_prob": 0.35,
+        "random_erasing_min_area": 0.02,
+        "random_erasing_max_area": 0.12,
+        "random_erasing_min_aspect": 0.5,
+        "random_erasing_max_aspect": 2.0,
+        "random_erasing_max_regions": 1,
+        "random_erasing_max_attempts": 10,
+        "random_erasing_min_side": 8,
+        "random_erasing_fill_mode": "mean",
+        "random_erasing_fill_value": 0,
     },
 }
 
@@ -124,6 +136,17 @@ def build_resolved_config(cfg, base_model_path, paths):
         "train_aug_rotate": train_cfg.get("aug_rotate", 0),
         "train_aug_effects": train_cfg.get("aug_effects", 0),
         "train_albumentations_set": train_cfg.get("albumentations_set", "standard"),
+        "train_random_erasing_prob": train_cfg.get("random_erasing_prob", 0.5),
+        "train_random_erasing_per_box_prob": train_cfg.get("random_erasing_per_box_prob", 0.35),
+        "train_random_erasing_min_area": train_cfg.get("random_erasing_min_area", 0.02),
+        "train_random_erasing_max_area": train_cfg.get("random_erasing_max_area", 0.12),
+        "train_random_erasing_min_aspect": train_cfg.get("random_erasing_min_aspect", 0.5),
+        "train_random_erasing_max_aspect": train_cfg.get("random_erasing_max_aspect", 2.0),
+        "train_random_erasing_max_regions": train_cfg.get("random_erasing_max_regions", 1),
+        "train_random_erasing_max_attempts": train_cfg.get("random_erasing_max_attempts", 10),
+        "train_random_erasing_min_side": train_cfg.get("random_erasing_min_side", 8),
+        "train_random_erasing_fill_mode": train_cfg.get("random_erasing_fill_mode", "mean"),
+        "train_random_erasing_fill_value": train_cfg.get("random_erasing_fill_value", 0),
         "train_loader_augmentations": train_cfg.get("loader_augmentations", {}),
         "train_aug_preview_dir": str(Path(paths["run_dir"]) / "aug_preview"),
         "train_aug_preview_count_per_loader": int(cfg.get("train_aug_preview_count_per_loader", 12)),
@@ -150,6 +173,8 @@ def apply_test_mode(cfg):
     cfg["train"]["aug_rotate"] = 0
     cfg["train"]["aug_effects"] = 0
     cfg["train"]["albumentations_set"] = "none"
+    cfg["train"]["random_erasing_prob"] = 0
+    cfg["train"]["random_erasing_per_box_prob"] = 0
     cfg["train_aug_preview_count_per_loader"] = min(int(cfg.get("train_aug_preview_count_per_loader", 4)), 4)
     return cfg
 
@@ -225,6 +250,8 @@ def run_train_adapter(resolved, manifest):
         batch_size=int(resolved.get("train_batch_size", 128)),
         lr=float(resolved.get("train_lr0", 0.01)),
         output=resolved["reid_model"],
+        emb=int(resolved.get("emb", 96)),
+        adapter_version=int(resolved.get("adapter_version", 2)),
     )
     manifest["stages"]["train-adapter"] = {
         "status": "ok",
@@ -389,11 +416,8 @@ def run_eval(resolved, paths, manifest):
     log_event(manifest, "eval:start")
     data = np.load(resolved["reid_dataset"])
     state_dict = torch.load(resolved["reid_model"], map_location="cpu")
-    in_dim = int(data["val_feats"][0].shape[0])
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = ReIDAdapter(in_dim=in_dim).to(device)
-    model.load_state_dict(state_dict)
-    model.eval()
+    model = build_reid_adapter_from_state_dict(state_dict, device=device)
 
     out = {}
     for v in data.files:

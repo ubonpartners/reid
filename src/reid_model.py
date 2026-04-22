@@ -3,7 +3,16 @@ import stuff
 from ultralytics import YOLO
 from copy import deepcopy
 import yaml
-from ultralytics.nn.modules.head import Pose, Pose26, PoseReID, Pose26ReID, ReIDAdapter
+from ultralytics.nn.modules.head import (
+    Pose,
+    Pose26,
+    Pose26ReID,
+    Pose26ReIDV2,
+    PoseReID,
+    PoseReIDV2,
+    ReIDAdapter,
+    ReIDAdapterV2,
+)
 
 
 def merge_weights_from(model_base, merge_from):
@@ -69,26 +78,40 @@ def _load_config(config_or_yaml):
     return stuff.load_dictionary(config_or_yaml)
 
 
-def _promote_head_to_reid_inplace(model):
+def _sniff_adapter_version_from_pth(reid_weights_path):
+    """Return (adapter_cls, emb) by inspecting keys+shapes in a saved state_dict."""
+    sd = torch.load(reid_weights_path, map_location="cpu")
+    if "feat_ln.weight" in sd:
+        emb = int(sd["mlp.8.weight"].shape[0])
+        return ReIDAdapterV2, emb
+    emb = int(sd["mlp.6.weight"].shape[0])
+    return ReIDAdapter, emb
+
+
+def _promote_head_to_reid_inplace(model, adapter_cls=ReIDAdapter, emb=None):
     """
     Promote the terminal pose head to its ReID variant by in-place class swap,
-    then attach a freshly initialised ReIDAdapter.
+    then attach a freshly initialised adapter (v1 or v2 depending on adapter_cls).
 
     This is the preferred fusion path: it preserves all detector weights exactly
     as they came from the base checkpoint and avoids any YAML rebuild.
     """
     head = model.model.model[-1]
+    is_v2 = adapter_cls is ReIDAdapterV2
     if isinstance(head, Pose26) and not isinstance(head, Pose26ReID):
-        head.__class__ = Pose26ReID
+        head.__class__ = Pose26ReIDV2 if is_v2 else Pose26ReID
     elif isinstance(head, Pose) and not isinstance(head, PoseReID):
-        head.__class__ = PoseReID
+        head.__class__ = PoseReIDV2 if is_v2 else PoseReID
     elif isinstance(head, (PoseReID, Pose26ReID)):
         pass
     else:
         raise ValueError(f"Unsupported head type for ReID promotion: {type(head).__name__}")
 
     in_dim = int(head.nc + getattr(head, "attr_nc", 0) + head.FEAT_PLUS_CODE)
-    head.reid = ReIDAdapter(in_dim=in_dim)
+    kwargs = {"in_dim": in_dim}
+    if emb is not None:
+        kwargs["emb"] = int(emb)
+    head.reid = adapter_cls(**kwargs)
     return model
 
 
@@ -163,8 +186,10 @@ def make_reid_model(config_or_yaml):
     dest_onnx    = config["reid_onnx_model"]
 
     if reid_yaml is None:
+        adapter_cls, emb = _sniff_adapter_version_from_pth(reid_weights)
+        print(f"Fusing {adapter_cls.__name__} (emb={emb}) from {reid_weights}")
         model = YOLO(yolo_weights, verbose=False)
-        model = _promote_head_to_reid_inplace(model)
+        model = _promote_head_to_reid_inplace(model, adapter_cls=adapter_cls, emb=emb)
     else:
         model = YOLO(reid_yaml, task="pose")
         model.save(dest_model)

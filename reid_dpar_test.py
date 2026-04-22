@@ -44,8 +44,20 @@ def _select_equally_spaced(indices, n):
 
 def _to_numpy1d(v):
     if isinstance(v, torch.Tensor):
-        return v.detach().cpu().numpy().astype(np.float32)
-    return np.asarray(v, dtype=np.float32)
+        return v.detach().cpu().numpy().astype(np.float32).reshape(-1)
+    if isinstance(v, dict) and v.get("__payload_kind__") == "ndarray":
+        # TensorRT/ReID-v2 can return serialized ndarray payload dicts.
+        codec = v.get("codec", "raw")
+        if codec != "raw":
+            raise ValueError(f"Unsupported ndarray payload codec: {codec!r}")
+        data = v.get("data")
+        dtype = v.get("dtype")
+        shape = v.get("shape")
+        if data is None or dtype is None or shape is None:
+            raise ValueError("Incomplete ndarray payload for ReID vector")
+        arr = np.frombuffer(data, dtype=np.dtype(dtype)).reshape(tuple(int(x) for x in shape))
+        return arr.astype(np.float32, copy=False).reshape(-1)
+    return np.asarray(v, dtype=np.float32).reshape(-1)
 
 
 def _image_to_bgr(image_or_path):
@@ -371,7 +383,7 @@ def _save_query_visuals(
     return saved
 
 
-def test(model_spec, grid_cols=5, grid_rows=4, min_conf=0.05, rc=None, datasets=None, visual_root=None):
+def test(model_spec, grid_cols=5, grid_rows=4, min_conf=0.05, rc=None, datasets=None, visual_root=None, fp32=False):
     runtime_model_spec, base_model_path, reid_model_pt = _parse_model_spec(model_spec)
 
     reid_model = None
@@ -380,9 +392,13 @@ def test(model_spec, grid_cols=5, grid_rows=4, min_conf=0.05, rc=None, datasets=
         model_name = os.path.basename(base_model_path)
         grid_label = f"{grid_cols}x{grid_rows}"
         test_name = f"{model_name} std-qg-v1 grid:{grid_cols}x{grid_rows}"
+        if fp32:
+            test_name += " fp32"
         if reid_model_pt is not None:
             test_name += f" {os.path.basename(reid_model_pt)}"
         test_short = _build_compact_test_label(base_model_path, reid_model_pt, grid_cols, grid_rows)
+        if fp32:
+            test_short += " fp32"
 
         def ensure_models_loaded():
             nonlocal reid_model, inf
@@ -392,7 +408,9 @@ def test(model_spec, grid_cols=5, grid_rows=4, min_conf=0.05, rc=None, datasets=
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 state_dict = torch.load(reid_model_pt, map_location="cpu")
                 reid_model = _build_reid_adapter_from_state_dict(state_dict, device)
-            inf = stuff.inference_wrapper(runtime_model_spec, thr=min_conf, get_feats=True, fold_attributes=True)
+            inf = stuff.inference_wrapper(
+                runtime_model_spec, thr=min_conf, get_feats=True, fold_attributes=True, half=not fp32
+            )
             inf.grid_cols = grid_cols
             inf.grid_rows = grid_rows
 
@@ -510,6 +528,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog='reid_dpar_test.py')
     parser.add_argument('--logging', type=str, default='info', help="Logging config: level[:console|file]")
     parser.add_argument('--config', type=str, default='/mldata/config/reid/reid_test.yaml', help='config file to use (json or yml)')
+    parser.add_argument(
+        '--fp32',
+        action='store_true',
+        help='Run PyTorch (.pt) YOLO inference in float32 (pass half=False to Ultralytics) instead of float16.',
+    )
     opt = parser.parse_args()
     stuff.configure_root_logger(opt.logging)
 
@@ -547,7 +570,9 @@ if __name__ == "__main__":
 
     for grid_w,grid_h in grids:
         for model in models:
-            results += test(model, grid_w, grid_h, rc=rc, datasets=datasets, visual_root=visual_root)
+            results += test(
+                model, grid_w, grid_h, rc=rc, datasets=datasets, visual_root=visual_root, fp32=opt.fp32
+            )
             display_results = _add_grid_mean_rows(results)
 
             stuff.show_data(display_results,
