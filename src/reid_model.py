@@ -115,6 +115,55 @@ def _promote_head_to_reid_inplace(model, adapter_cls=ReIDAdapter, emb=None):
     return model
 
 
+def _save_qat_fused_ckpt(model, base_qat_path, fused_ckpt_path):
+    """
+    Re-save a QAT checkpoint after REID promotion.
+
+    The QAT load path (`attempt_load_one_weight` in tasks.py) ignores `ckpt['model']`
+    and instead rebuilds via `model_class(yaml) → restore_from_modelopt_state → load_state_dict`.
+    A standard `YOLO.save()` therefore loses the REID adapter (state_dict in the original
+    QAT ckpt is pre-fusion and yaml has the un-promoted head class).
+
+    This helper:
+      * Preserves the original `modelopt_state`, `model_class`, `yaml`, `names`, `nc`, etc.
+      * Replaces `state_dict` with the fused model's state dict (includes `head.reid.*` weights
+        plus any modelopt amax buffers).
+      * Stores a `reid_promotion` descriptor describing the head/adapter classes and shape so
+        the loader can class-swap the head and graft the adapter BEFORE restoring Q/DQ.
+      * Marks task as "posereid" so the predictor routes to PoseReIDPredictor.
+    """
+    raw = torch.load(base_qat_path, map_location="cpu", weights_only=False)
+    if "modelopt_state" not in raw:
+        raise RuntimeError(
+            f"_save_qat_fused_ckpt called on non-QAT base checkpoint: {base_qat_path}"
+        )
+
+    head = model.model.model[-1]
+    if not hasattr(head, "reid"):
+        raise RuntimeError("Fused model has no head.reid; promotion did not run before re-save.")
+
+    promotion = {
+        "head_cls_name": head.__class__.__name__,
+        "adapter_cls_name": head.reid.__class__.__name__,
+        "in_dim": int(head.reid.in_dim),
+        "emb": int(head.reid.emb),
+    }
+
+    new_ckpt = dict(raw)
+    new_ckpt["state_dict"] = model.model.state_dict()
+    new_ckpt["reid_promotion"] = promotion
+    new_ckpt["task"] = "posereid"
+    train_args = dict(new_ckpt.get("train_args") or {})
+    train_args["task"] = "posereid"
+    new_ckpt["train_args"] = train_args
+    # `model` / `ema` are unused on the QAT load path; clearing prevents stale-pickle
+    # confusion if some non-QAT loader ever opens this ckpt.
+    new_ckpt["model"] = None
+    new_ckpt["ema"] = None
+
+    torch.save(new_ckpt, fused_ckpt_path)
+
+
 def _copy_ckpt_metadata(base_ckpt_path, fused_ckpt_path):
     """Copy task/names/attr metadata from the base checkpoint into the fused checkpoint."""
     print(f"Loading {base_ckpt_path}")
@@ -185,6 +234,16 @@ def make_reid_model(config_or_yaml):
     dest_model   = config["reid_yolo_model"]
     dest_onnx    = config["reid_onnx_model"]
 
+    # Detect QAT input (modelopt-quantized .pt) so we can take the Q/DQ-preserving save path.
+    raw_base_ckpt = torch.load(yolo_weights, map_location="cpu", weights_only=False)
+    is_qat = "modelopt_state" in raw_base_ckpt
+    del raw_base_ckpt  # free; we re-load inside _save_qat_fused_ckpt
+    if is_qat and reid_yaml is not None:
+        raise NotImplementedError(
+            "QAT input does not support the manual reid_yaml rebuild path; "
+            "remove `reid_yaml` from the config so the in-place class-swap fusion is used."
+        )
+
     if reid_yaml is None:
         adapter_cls, emb = _sniff_adapter_version_from_pth(reid_weights)
         print(f"Fusing {adapter_cls.__name__} (emb={emb}) from {reid_weights}")
@@ -197,9 +256,14 @@ def make_reid_model(config_or_yaml):
         merge_weights_from(model, yolo_weights)
 
     merge_weights_from_pth(model, reid_weights, debug=True)
-    model.save(dest_model)
 
-    _copy_ckpt_metadata(yolo_weights, dest_model)
+    if is_qat:
+        # QAT-aware re-save: preserves modelopt_state and stores a reid_promotion descriptor
+        # so the loader can class-swap the head and graft the adapter before restoring Q/DQ.
+        _save_qat_fused_ckpt(model, yolo_weights, dest_model)
+    else:
+        model.save(dest_model)
+        _copy_ckpt_metadata(yolo_weights, dest_model)
     print(f"Saved finished output model {dest_model}")
 
     model = YOLO(dest_model)
