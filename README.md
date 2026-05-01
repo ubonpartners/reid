@@ -249,6 +249,58 @@ The tracker in `ubon_cstuff/src/track/utrack/utrack.c` currently has `#define RE
 
 ---
 
+## QAT-aware ReID fusion
+
+### The PTQ ordering problem
+
+In the previous flow the REID adapter was trained on features extracted from the FP16/FP32 base model, then fused into a `.pt`, and only after fusion was the whole graph quantized via TensorRT PTQ. The adapter therefore learned a feature distribution it would never see at inference time — once PTQ inserted Q/DQ on every Conv in the backbone, the per-detection feature vectors going into the adapter shifted, and the embedding space the adapter had carved out no longer aligned with retrieval ground truth.
+
+The damage was significant. Comparing identical models / dataset / training recipe, only changing the int8 path:
+
+| Method | Top-1 | ReID mAP |
+| --- | --- | --- |
+| FP16 (no quantization) | 0.730 | 0.421 |
+| Old: FP16 reid train + post-fusion PTQ | 0.628 | 0.366 |
+| New: QAT base + reid train on QAT model | 0.736 | 0.423 |
+
+The new flow recovers the FP16 baseline (slightly exceeds it on Top-1, within noise on mAP) while delivering an int8 backbone for deployment. The PTQ-after-fusion flow lost ~14% relative on Top-1 and ~13% relative on mAP.
+
+### The new flow
+
+The adapter only needs the backbone to be frozen during training; whether that backbone runs in FP32, FP16, or QAT fake-quant is opaque to the triplet loss. So the fix is purely an ordering change:
+
+1. **Train the base detector with QAT.** Use `int8=True` in `model.train(...)` on the base pose model. The output is a `.pt` that carries Q/DQ wrappers and `modelopt_state`. See `UBON_QAT.md` in the ultralytics repo.
+2. **Run the normal REID pipeline against the QAT `.pt`.** Just point `--base-model` at the QAT checkpoint:
+
+   ```bash
+   python reid_pipeline.py \
+     --base-model /mldata/models/v10/pt/yolo26s-v10-210226-qat.pt \
+     --run all
+   ```
+
+   The dataset-build stage now extracts per-detection features from the fake-quant backbone, so the adapter trains against the exact same feature distribution it will see at inference.
+3. **Fusion auto-detects QAT.** `make_reid_model()` in `src/reid_model.py` checks for `modelopt_state` in the source `.pt` and takes a QAT-preserving re-save path:
+
+   - The original `modelopt_state` is preserved verbatim.
+   - The fused model's `state_dict` (now including `head.reid.*`) replaces the saved one.
+   - A `reid_promotion` descriptor `{head_cls_name, adapter_cls_name, in_dim, emb}` is added so the ultralytics QAT loader can class-swap the head and graft the adapter at load time.
+
+   No flags or config changes needed; the QAT detection is structural.
+4. **Export.** ONNX export (`format="onnx"` / `format="engine"`) keeps explicit Q/DQ nodes on the backbone and quantized regions of the head. The ReID adapter itself is small (~150k params, ~0.3 MFLOPs per detection) and is left at high precision — the quantization saving comes from the backbone, and the adapter benefits from the headroom.
+
+### Why this works
+
+The adapter is a per-detection projection on top of fixed backbone features. PTQ shifts the backbone feature distribution after the adapter is trained; QAT shifts it *before*. From the adapter's perspective the QAT backbone is just "the backbone" — there's no train/deploy mismatch to recover from. Backbone-side INT8 savings are unchanged because the adapter doesn't touch backbone Conv weights at all.
+
+### Operational notes
+
+- The QAT base model must come from the matching ultralytics fork (`ubon26` / later) so the `_modelopt_state` key is present and the loader knows to take the QAT path.
+- Adapter training time and memory are unchanged; only the dataset-build stage runs through fake-quant convs (slightly slower per call, but typically dataset build is I/O-bound anyway).
+- Sanity stage (`--run sanity`) and eval stage work the same on QAT-fused checkpoints. Sanity compares fused vs base detection parity, where "base" is the QAT `.pt` — so detection counts/IoU should match exactly.
+- For mixing-and-matching: if you have an old (non-QAT) adapter and want to re-fuse it onto a QAT base, the same `--run fuse` command works because fusion only injects adapter weights and patches metadata — the adapter doesn't need re-training when only the base backbone's quantization changes (though re-training against the QAT base will give the numbers in the table above).
+
+---
+
 ## Config format
 
 Only user intent belongs in config (datasets + training controls).
