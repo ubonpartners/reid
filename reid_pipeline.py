@@ -458,7 +458,7 @@ def main():
         "--max-processes",
         type=int,
         default=None,
-        help="Optional cap for dataset-generation worker processes (applies to config num_workers).",
+        help="Optional explicit worker count for dataset-generation processes (overrides config num_workers).",
     )
     parser.add_argument("--force", action="store_true", help="Force rerun stages even if artifacts exist")
     opt = parser.parse_args()
@@ -472,7 +472,7 @@ def main():
     if opt.max_processes is not None:
         if opt.max_processes < 1:
             raise ValueError("--max-processes must be >= 1")
-        cfg["num_workers"] = min(int(cfg.get("num_workers", 1)), int(opt.max_processes))
+        cfg["num_workers"] = int(opt.max_processes)
 
     base_model = opt.base_model
     if not os.path.exists(base_model):

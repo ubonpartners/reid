@@ -427,11 +427,14 @@ def get_feat_process_batch(batch, model, img_size, person_class_index=0, device=
         for j in range(num):
             if best_feats[j]!=None:
                 feat = best_feats[j]
-                # Multiprocess workers may run on different GPUs. Sending CUDA
+                # Multiprocess workers may run on different GPUs. Sending torch
                 # tensors through multiprocessing queues can trigger CUDA IPC
-                # peer-access failures on hosts with non-P2P GPU pairs.
+                # or tensor-sharing transport failures across processes.
                 if torch.is_tensor(feat):
-                    feat = feat.detach().cpu()
+                    feat = feat.detach().cpu().numpy()
+                else:
+                    feat = np.asarray(feat)
+                feat = feat.astype(np.float32, copy=False)
                 ret_feats.append(feat)
                 ret_ids.append(id_list[j])
                 ret_idx.append(idx_list[j])
@@ -636,7 +639,8 @@ def get_feats(img_list, id_list_in, index_list_in, model_name,
         sizes=[0,0,0]
         nz=[0,0,0]
         for f in feat_list:
-            l=f.cpu().to(torch.int).tolist()
+            arr = f.detach().cpu().numpy() if torch.is_tensor(f) else np.asarray(f)
+            l = arr.astype(np.int32, copy=False).tolist()
             for i in range(3):
                 if l[512+num_classes+i]!=0:
                     nz[i]+=l.count(0)
@@ -801,7 +805,10 @@ def _run_dataset_feature_extract(dataset_name, dataset_groups, config, num_class
             np.array([], dtype=np.int64),
         )
     filtered_vectors, filtered_ids, filtered_indices = zip(*filtered)
-    features_np = torch.stack([v.cpu() for v in filtered_vectors]).numpy().astype(np.float32)
+    features_np = np.stack(
+        [v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v) for v in filtered_vectors],
+        axis=0,
+    ).astype(np.float32, copy=False)
     labels_np = np.array(filtered_ids, dtype=np.int64)
     indices_np = np.array(filtered_indices, dtype=np.int64)
     num_ids = len(np.unique(filtered_ids))
