@@ -72,7 +72,7 @@ python reid_pipeline.py \
 - `--config`: YAML/JSON user config (datasets, train hyperparameters, optional overrides).
 - `--project`: output root override.
 - `--name`: run folder name override.
-- `--max-processes N`: cap the number of dataset-generation worker processes (caps `num_workers` from config).
+- `--max-processes N`: set the number of dataset-generation worker processes (overrides `num_workers` from config).
 - `--test`: smoke mode (few hundred images, short training).
 - `--force`: re-run stage even if artifact already exists.
 

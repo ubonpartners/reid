@@ -426,7 +426,13 @@ def get_feat_process_batch(batch, model, img_size, person_class_index=0, device=
                 best_feats[gn]=det_feats[int(best_det_idx[gn])]
         for j in range(num):
             if best_feats[j]!=None:
-                ret_feats.append(best_feats[j])
+                feat = best_feats[j]
+                # Multiprocess workers may run on different GPUs. Sending CUDA
+                # tensors through multiprocessing queues can trigger CUDA IPC
+                # peer-access failures on hosts with non-P2P GPU pairs.
+                if torch.is_tensor(feat):
+                    feat = feat.detach().cpu()
+                ret_feats.append(feat)
                 ret_ids.append(id_list[j])
                 ret_idx.append(idx_list[j])
     return ret_feats, ret_ids, ret_idx
