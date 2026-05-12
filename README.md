@@ -317,7 +317,7 @@ datasets:
   # max_ids_per_loader: 200
 
 yolo_batch_size: 16   # grids per YOLO call; lower if OOM during dataset build
-num_workers: 4        # parallel dataset-build processes
+num_workers: 4        # parallel dataset-build processes (auto-sharded across GPUs when multiple GPUs are present)
 
 train:
   epochs: 100

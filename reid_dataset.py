@@ -381,12 +381,20 @@ def on_predict_start(predictor: object, persist: bool = False) -> None:
     predictor.model.model.model[-1].register_forward_pre_hook(pre_hook)
     predictor._feat_hooks_installed = True
 
-def get_feat_process_batch(batch, model, img_size, person_class_index=0):
+def get_feat_process_batch(batch, model, img_size, person_class_index=0, device=None):
     images=[b["img"] for b in batch]
-    results=model.predict(images, verbose=False, half=True,
-                          conf=0.1, classes=[person_class_index],
-                          imgsz=[img_size,img_size], rect=True,
-                          end2end=False)
+    predict_kwargs = {
+        "verbose": False,
+        "half": True,
+        "conf": 0.1,
+        "classes": [person_class_index],
+        "imgsz": [img_size, img_size],
+        "rect": True,
+        "end2end": False,
+    }
+    if device is not None:
+        predict_kwargs["device"] = device
+    results=model.predict(images, **predict_kwargs)
     ret_feats=[]
     ret_ids=[]
     ret_idx=[]
@@ -423,7 +431,7 @@ def get_feat_process_batch(batch, model, img_size, person_class_index=0):
                 ret_idx.append(idx_list[j])
     return ret_feats, ret_ids, ret_idx
 
-def make_feat_process_batch_work(model, batch_work):
+def make_feat_process_batch_work(model, batch_work, device=None):
     image_batch=[]
     for w in batch_work:
         img, grid_boxes=stuff.create_image_grid(w["imgs"], w["M"], w["N"],
@@ -442,12 +450,29 @@ def make_feat_process_batch_work(model, batch_work):
                             "id_list":w["ids"],
                             "idx_list":w["idxs"],
                             "num":len(w["ids"])})
-    feats, ids, idxs=get_feat_process_batch(image_batch, model, w["img_size"])
+    feats, ids, idxs=get_feat_process_batch(image_batch, model, w["img_size"], device=device)
     return {"feats":feats, "ids":ids, "idxs": idxs}
 
-def work_queue_fn(work_item, mpwq_context, mpwq_progress_fn=None):
-    model=mpwq_context["process_setup_results"]
-    return make_feat_process_batch_work(model, work_item)
+def _resolve_dataset_worker_device(worker_id=0, auto_gpu_worker_shard=True):
+    if not torch.cuda.is_available():
+        return None
+    num_gpus = torch.cuda.device_count()
+    if auto_gpu_worker_shard and num_gpus > 1:
+        return f"cuda:{int(worker_id) % num_gpus}"
+    return "cuda:0"
+
+def work_queue_fn(work_item, mpwq_context, mpwq_progress_fn=None, model_name=None, auto_gpu_worker_shard=True):
+    model = mpwq_context.get("process_setup_results")
+    if model is None:
+        worker_id = int(mpwq_context.get("worker_id", 0))
+        model = make_model(model_name)
+        mpwq_context["process_setup_results"] = model
+        mpwq_context["dataset_worker_device"] = _resolve_dataset_worker_device(
+            worker_id=worker_id,
+            auto_gpu_worker_shard=auto_gpu_worker_shard,
+        )
+    device = mpwq_context.get("dataset_worker_device")
+    return make_feat_process_batch_work(model, work_item, device=device)
 
 def make_model(args):
     # each multiprocess worker needs to create it's own yolo model instance
@@ -471,6 +496,7 @@ def get_feats(img_list, id_list_in, index_list_in, model_name,
               random_erasing_fill_mode="mean",
               random_erasing_fill_value=0,
               num_workers=1, num_classes=40,
+              auto_gpu_worker_shard=True,
               debug_feature_stats=False,
               mp_min_work_items=6,
               force_multiprocess=True):
@@ -545,8 +571,6 @@ def get_feats(img_list, id_list_in, index_list_in, model_name,
 
     results=[]
 
-    make_model_args=model_name
-
     # step 3: do the actual work, each 'work item' is a batch
     # of grid images. The work involves loading the reid images,
     # rendering them to the grids, then running the yolo model
@@ -556,16 +580,23 @@ def get_feats(img_list, id_list_in, index_list_in, model_name,
     # but only ~20 mins with 8 processes
 
     if num_workers > 1 and (force_multiprocess or len(work_items) >= mp_min_work_items):
-        results=stuff.mp_workqueue_run(work_items, work_queue_fn,
+        worker_fn = partial(
+            work_queue_fn,
+            model_name=model_name,
+            auto_gpu_worker_shard=auto_gpu_worker_shard,
+        )
+        results=stuff.mp_workqueue_run(work_items, worker_fn,
                                desc=f"multiprocess:{name}",
                                num_workers=num_workers,
-                               process_setup_fn=make_model,
-                               process_setup_args=make_model_args,
                                show_pbars=False)
     else:
-        model=make_model(make_model_args)
+        model=make_model(model_name)
+        device = _resolve_dataset_worker_device(
+            worker_id=0,
+            auto_gpu_worker_shard=auto_gpu_worker_shard,
+        )
         for i,batch_work in tqdm(enumerate(work_items), total=len(work_items), leave=False):
-            results.append(make_feat_process_batch_work(model, batch_work))
+            results.append(make_feat_process_batch_work(model, batch_work, device=device))
 
     # finally combine the results together
 
