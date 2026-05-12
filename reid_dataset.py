@@ -453,24 +453,37 @@ def make_feat_process_batch_work(model, batch_work, device=None):
     feats, ids, idxs=get_feat_process_batch(image_batch, model, w["img_size"], device=device)
     return {"feats":feats, "ids":ids, "idxs": idxs}
 
-def _resolve_dataset_worker_device(worker_id=0, auto_gpu_worker_shard=True):
-    if not torch.cuda.is_available():
-        return None
-    num_gpus = torch.cuda.device_count()
-    if auto_gpu_worker_shard and num_gpus > 1:
-        return f"cuda:{int(worker_id) % num_gpus}"
-    return "cuda:0"
+def _resolve_dataset_worker_device():
+    return "cuda:0" if torch.cuda.is_available() else None
 
-def work_queue_fn(work_item, mpwq_context, mpwq_progress_fn=None, model_name=None, auto_gpu_worker_shard=True):
+
+def _parse_visible_cuda_devices():
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip() != ""]
+
+def work_queue_fn(
+    work_item,
+    mpwq_context,
+    mpwq_progress_fn=None,
+    model_name=None,
+    auto_gpu_worker_shard=True,
+    visible_cuda_devices=None,
+):
     model = mpwq_context.get("process_setup_results")
     if model is None:
         worker_id = int(mpwq_context.get("worker_id", 0))
+        # Pin CUDA visibility before constructing the model so this process'
+        # first CUDA context binds to the intended GPU.
+        if auto_gpu_worker_shard and visible_cuda_devices and len(visible_cuda_devices) > 1:
+            os.environ["CUDA_VISIBLE_DEVICES"] = visible_cuda_devices[worker_id % len(visible_cuda_devices)]
+            device = "cuda:0"
+        else:
+            device = _resolve_dataset_worker_device()
         model = make_model(model_name)
         mpwq_context["process_setup_results"] = model
-        mpwq_context["dataset_worker_device"] = _resolve_dataset_worker_device(
-            worker_id=worker_id,
-            auto_gpu_worker_shard=auto_gpu_worker_shard,
-        )
+        mpwq_context["dataset_worker_device"] = device
     device = mpwq_context.get("dataset_worker_device")
     return make_feat_process_batch_work(model, work_item, device=device)
 
@@ -579,11 +592,20 @@ def get_feats(img_list, id_list_in, index_list_in, model_name,
     # it takes ~2 hours to generate 1 million images on my 3090
     # but only ~20 mins with 8 processes
 
+    visible_cuda_devices = []
+    if auto_gpu_worker_shard and num_workers > 1 and torch.cuda.is_available():
+        visible_cuda_devices = _parse_visible_cuda_devices()
+        if not visible_cuda_devices:
+            num_gpus = torch.cuda.device_count()
+            if num_gpus > 1:
+                visible_cuda_devices = [str(i) for i in range(num_gpus)]
+
     if num_workers > 1 and (force_multiprocess or len(work_items) >= mp_min_work_items):
         worker_fn = partial(
             work_queue_fn,
             model_name=model_name,
             auto_gpu_worker_shard=auto_gpu_worker_shard,
+            visible_cuda_devices=visible_cuda_devices,
         )
         results=stuff.mp_workqueue_run(work_items, worker_fn,
                                desc=f"multiprocess:{name}",
@@ -591,10 +613,7 @@ def get_feats(img_list, id_list_in, index_list_in, model_name,
                                show_pbars=False)
     else:
         model=make_model(model_name)
-        device = _resolve_dataset_worker_device(
-            worker_id=0,
-            auto_gpu_worker_shard=auto_gpu_worker_shard,
-        )
+        device = _resolve_dataset_worker_device()
         for i,batch_work in tqdm(enumerate(work_items), total=len(work_items), leave=False):
             results.append(make_feat_process_batch_work(model, batch_work, device=device))
 
